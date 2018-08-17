@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script>
+"use strict";
+
+var _instanceId = window.location.hash.slice(1);
+
+var worker = new Worker("jailed.js");
+worker.onerror = function (event) {
+    window.parent.postMessage({
+        type: "error",
+        id: _instanceId,
+        message: event.message,
+        filename: event.filename,
+        lineno: event.lineno},"*");
+};
+
+worker.onmessage = function (event) {
+    window.parent.postMessage(Object.assign(event.data,{id: _instanceId}),"*");
+};
+
+window.addEventListener("message",function (event) {
+    worker.postMessage(event.data);
+},false);
+
+window.parent.postMessage({type: "getargs",id: _instanceId},"*");
+  </script>
+</head>
+<body></body>
+</html>

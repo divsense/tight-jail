@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style type="text/css">
+    .error { color: red; }
+  </style>
+  <script src="jail.js"></script>
+</head>
+<body>
+  <h1>Test</h1>
+  <div>
+    <input type="radio" id="script_input" name="input_type" value="script">
+    <label for="script">JavaScript file</label>
+    <input type="text" id="script_input_val" name="script_input_val">
+  </div>
+  <div>
+    <input type="radio" checked id="text_input" name="input_type" value="text">
+    <label for="script">text input</label>
+    <textarea cols="30" id="text_input_val" name="text_input_val">
+function main(a,b,c) {
+    return (a + b) * c;
+}
+    </textarea>
+  </div>
+  <div>
+    <label for="arguments">arguments</label>
+    <input type="text" id="arguments" name="arguments" value="3,5,7">
+  </div>
+  <div>
+    <button id="exc_button">Execute</button>
+    <button id="stop_button" disabled>Cancel</button>
+  </div>
+  <div><h3>result:</h3><div id="result">
+  </div></div>
+  <script>
+var exc_button = document.getElementById("exc_button");
+var stop_button = document.getElementById("stop_button");
+var jail = null;
+
+function report_result(success,value) {
+    var res_div = document.getElementById("result");
+    res_div.innerHTML = "";
+    if(success) {
+        res_div.className = "";
+        res_div.appendChild(new Text(value.toString()));
+    } else {
+        res_div.className = "error";
+        res_div.appendChild(new Text(value.message));
+    }
+    exc_button.disabled = false;
+    stop_button.disabled = true;
+}
+
+exc_button.addEventListener("click",function(event) {
+    var args = eval("[" + document.getElementById("arguments").value + "]");
+    if(document.getElementById("script_input").checked) {
+        jail = runLinkJailed(report_result,document.getElementById("script_input_val").value,{args: args});
+    } else {
+        jail = runCodeJailed(report_result,document.getElementById("text_input_val").value,{args: args});
+    }
+    exc_button.disabled = true;
+    stop_button.disabled = false;
+},false);
+
+stop_button.addEventListener("click",function(event) {
+    jail.cancel();
+    exc_button.disabled = false;
+    stop_button.disabled = true;
+});
+  </script>
+</body>
+</html>
