@@ -96,7 +96,10 @@ window.addEventListener("message",function (event) {
         cleanJail(id);
         break;
     case "error":
-        finish_c(false,{name: event.data.name,message: event.data.message});
+        finish_c(false,{
+            message: event.data.message,
+            filename: event.data.filename,
+            lineno: event.data.lineno});
         cleanJail(id);
         break;
     case "user":
