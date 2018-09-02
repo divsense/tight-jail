@@ -1,110 +1,183 @@
 
-var _idCount = 0;
-var _jails = {};
+class JailError extends Error {}
+JailError.prototype.name = 'JailError';
 
-function uniqueId() {
-    /* a random number is tacked on to prevent anyone from relying on the ID to
-    have any particular value */
-    var r = _idCount + "." + Math.random();
-    _idCount += 1;
-    return r;
-}
+/**
+ * Something went wrong in the jail process.
+ */
+class InternalJailError extends JailError {}
+InternalJailError.prototype.name = "InternalJailError";
 
-function createFrame() {
-    var f = document.createElement("iframe");
-    f.sandbox = "allow-scripts allow-same-origin";
-    f.style.display = "none";
-    return f;
-}
+/** The request was invalid or had the wrong format. */
+class RequestJailError extends JailError {}
+RequestJailError.prototype.name = "RequestJailError";
 
-function cleanJail(id) {
-    var j = _jails[id];
-    delete _jails[id];
-    if(j._autoclean) j._frame.parentElement.removeChild(j._frame);
-    delete j._frame;
-}
+/** The result was invalid or had the wrong format (somehow). */
+class ResultJailError extends JailError {}
+ResultJailError.prototype.name = "ResultJailError";
 
-function runXJailed(callback,isLink,script,options) {
-    if(options === undefined) options = {};
-    var create = options.frame === undefined;
-    if(create) options.frame = createFrame();
-    if(options.args === undefined) options.args = [];
+/** The jail process didn't have enough memory to complete an action. */
+class MemoryJailError extends InternalJailError {}
+MemoryJailError.prototype.name = "MemoryJailError";
+
+/** An error occurred with socket or pipe connection to the jail process. */
+class DisconnectJailError extends JailError {}
+DisconnectJailError.prototype.name = "DisconnectJailError";
+
+/** The connection was terminated manually. */
+class ClosedJailError extends DisconnectJailError {}
+DisconnectJailError.prototype.name = "ClosedJailError";
+
+
+/** The jailed code threw an uncaught exception. */
+class ClientError extends Error {}
+ClientError.prototype.name = "ClientError";
+
+class JailContext {
+    static uniqueId() {
+        /* a random number is tacked on to prevent anyone from relying on the ID to
+        have any particular value */
+        var r = JailContext._idCount + "." + Math.random();
+        JailContext._idCount += 1;
+        return r;
+    }
+
+    static createFrame() {
+        var f = document.createElement("iframe");
+        f.sandbox = "allow-scripts allow-same-origin";
+        f.style.display = "none";
+        return f;
+    }
     
-    var id = uniqueId();
-    var jail = {
-        _id: id,
-        _frame: options.frame,
-        _finishCallback: callback,
-        _isLink: isLink,
-        _script: script,
-        msgCallback: options.msgCallback,
-        _args: options.args,
-        _autoclean: create,
-        cancel: function() {
-            if(this._frame) {
-                this._frame.setAttribute("src","about:blank");
-                cleanJail(this._id);
+    constructor(autoClose=false) {
+        this.autoClose = autoClose;
+        this._frameReady = false;
+        this._id = JailContext.uniqueId();
+        
+        this._pendingRequests = [];
+        
+        // wait for a message from the frame before sending any requests
+        this._requestQueue = [[
+            () => {
+                this._frameReady = true;
+                for(let [req,callbacks] of this._pendingRequests) this._dispatch_request(req,callbacks);
+                this._pendingRequests = null;
+            },
+            () => {}]];
+        
+        this._frame = JailContext.createFrame();
+        this._frame.setAttribute("src","jailed.html#" + this._id);
+        document.body.appendChild(this._frame);
+        JailContext._jails[this._id] = this;
+    }
+    
+    _dispatch_result(msg,resolve,reject) {
+        switch(msg.type) {
+        case 'result':
+            resolve(msg.value);
+            break;
+        case 'success':
+            resolve();
+            break;
+        case 'resultexception':
+            reject(new ClientError(msg.message));
+            break;
+        case 'error':
+            switch(msg.errtype) {
+            case 'request': reject(new RequestJailError(msg.message)); break;
+            case 'internal': reject(new InternalJailError(msg.message)); break;
+            case 'memory': reject(new MemoryJailError(msg.message)); break;
+            default: reject(new ResultJailError('unknown error type')); break;
             }
-        },
-        postMessage: function(data) {
-            if(this._frame) this._frame.contentWindow.postMessage({type: "user",data: data},"*");
-        }};
-    _jails[id] = jail;
+            break;
+        default:
+            reject(new ResultJailError('unknown result type'));
+            break;
+        }
+        
+        if(this.autoClose && this._requestQueue.length == 0) this.close();
+    }
+
+    _dispatch_request(req,callbacks) {
+        this._requestQueue.push(callbacks);
+        this._frame.contentWindow.postMessage(req,"*");
+    }
+
+    _request(req) {
+        return new Promise(
+            (resolve,reject) => {
+                if(this._frameReady) this._dispatch_request(req,[resolve,reject]);
+                else this._pendingRequests.push([req,[resolve,reject]]);
+            });
+    }
     
-    options.frame.setAttribute("src","jailed.html#" + id);
-    document.body.appendChild(options.frame);
+    /**
+     * Return a promise to evaluate a string containing JavaScript code and
+     * return the result.
+     */
+    eval(code) {
+        return this._request({type: "eval",code: code});
+    }
     
-    return jail;
+    /**
+     * Return a promise to execute a string containing JavaScript code.
+     */
+    exec(code) {
+        return this._request({type: "exec",code: code});
+    }
+    
+    /**
+     * Return a promise to execute a JavaScript function.
+     */
+    call(func,args=[]) {
+        return this._request({type: "call",func: func,args: args});
+    }
+    
+    /**
+     * Return a promise to execute a remote JavaScript file.
+     */
+    execURI(uri,context=null) {
+        return this._request({type: "execuri",uri: uri});
+    }
+    
+    /**
+     * Destroy the jail.
+     * 
+     * This will cause pending requests to be rejected with an instance of
+     * ClosedJailError.
+     */
+    close() {
+        if(this._frame) {
+            delete JailContext._jails[this._id];
+            this._frame.parentElement.removeChild(this._frame);
+            this._frame = null;
+            const e = new ClosedJailError('the connection has been destroyed');
+            if(this._pendingRequests) {
+                for(let p of this._pendingRequests) p[1][1](e);
+                this._pendingRequests = null;
+            }
+            for(let r of this._requestQueue) r[1](e);
+            this._requestQueue = null;
+        }
+    }
 }
 
-function runLinkJailed(callback,source,options) {
-    return runXJailed(callback,true,source,options);
-}
+JailContext._idCount = 0;
+JailContext._jails = {};
 
-function runCodeJailed(callback,code,options) {
-    return runXJailed(callback,false,code,options);
-}
 
-window.addEventListener("message",function (event) {
-    var id = event.data.id;
-    var jail = _jails[id];
+window.addEventListener("message",(event) => {
+    const jail = JailContext._jails[event.data.id];
     
     /* this can happen if an iframe was removed before its code finished */
     if(jail === undefined) return;
     
-    // call it without "this" set
-    var finish_c = jail._finishCallback;
-    var user_c = jail.msgCallback;
-    
-    switch(event.data.type) {
-    case "getargs":
-        jail._frame.contentWindow.postMessage(
-            {
-                type: "args",
-                isLink: jail._isLink,
-                script: jail._script,
-                args: jail._args},
-            "*");
-        
-        // release the references
-        delete jail._script;
-        delete jail._args;
-        
-        break;
-    case "success":
-        finish_c(true,event.data.result);
-        cleanJail(id);
-        break;
-    case "error":
-        finish_c(false,{
-            message: event.data.message,
-            filename: event.data.filename,
-            lineno: event.data.lineno});
-        cleanJail(id);
-        break;
-    case "user":
-        if(user_c) user_c(event.data.data);
-        break;
-    }
+    const callbacks = jail._requestQueue.shift();
+    jail._dispatch_result(event.data,callbacks[0],callbacks[1]);
 },false);
+
+
+function evalJailed(code) {
+    return (new JailContext(true)).eval(code);
+}
 

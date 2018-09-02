@@ -54,17 +54,21 @@ function report_result(success,value) {
 
 exc_button.addEventListener("click",function(event) {
     var args = eval("[" + document.getElementById("arguments").value + "]");
+    jail = new JailContext(true);
     if(document.getElementById("script_input").checked) {
-        jail = runLinkJailed(report_result,document.getElementById("script_input_val").value,{args: args});
+        jail.execURI(document.getElementById("script_input_val").value);
     } else {
-        jail = runCodeJailed(report_result,document.getElementById("text_input_val").value,{args: args});
+        jail.exec(document.getElementById("text_input_val").value);
     }
+    jail.call('main',args)
+        .then((r) => { report_result(true,r); })
+        .catch((e) => { report_result(false,e); });
     exc_button.disabled = true;
     stop_button.disabled = false;
 },false);
 
 stop_button.addEventListener("click",function(event) {
-    jail.cancel();
+    jail.close();
     exc_button.disabled = false;
     stop_button.disabled = true;
 });

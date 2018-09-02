@@ -1,30 +1,43 @@
+'use strict';
 
-function postUserMessage(data) {
-    postMessage({
-        type: "user",
-        data: data});
-}
-
-onmessage = function (event) {
-    switch(event.data.type) {
-    case "args":
-        if(event.data.isLink) importScripts(event.data.script);
-        else eval(event.data.script);
-        
-        var retval = main.apply(null,event.data.args);
-        postMessage(
-            {type: "success",result: retval});
-        
-        break;
-    case "user":
-        // call "onUserMessage" if it's defined
-        try {
-            onUserMessage;
-        } catch(e) {
+onmessage = (event) => {
+    /* calling eval indirectly will cause it to execute in global scope, which
+       is what we want */
+    const eval_ = eval;
+    
+    try {
+        switch(event.data.type) {
+        case 'eval':
+            postMessage({type: 'result',value: eval_(event.data.code)});
             break;
+        case 'exec':
+            eval_(event.data.code);
+            postMessage({type: 'success'});
+            break;
+        case 'execuri':
+            importScripts(event.data.uri);
+            postMessage({type: 'success'});
+            break;
+        case 'call':
+            postMessage({
+                type: 'result',
+                value: self[event.data.func].apply(null,event.data.args)});
+            break;
+        default:
+            postMessage({
+                type: 'error',
+                errtype: 'request',
+                message: 'unknown request type'})
         }
-        onUserMessage(event.data.data);
-        break;
+    } catch(e) {
+        postMessage({
+            type: 'resultexception',
+            message: e.message,
+            filename: e.filename,
+            lineno: e.lineno},'*');
     }
 };
+
+// signal that we are ready to receive requests
+postMessage({type: 'success'});
 

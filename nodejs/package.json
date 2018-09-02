@@ -1,0 +1,23 @@
+{
+  "name": "tight-jail",
+  "version": "0.2.0",
+  "description": "Execute arbitrary JavaScript securely",
+  "main": "index.js",
+  "scripts": {
+    "test": "mocha"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/divsense/tight-jail.git"
+  },
+  "keywords": [
+    "jail",
+    "sandbox"
+  ],
+  "author": "Rouslan Korneychuk",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/divsense/tight-jail/issues"
+  },
+  "homepage": "https://github.com/divsense/tight-jail#readme"
+}

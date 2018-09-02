@@ -3,27 +3,26 @@
 <head>
   <meta charset="utf-8">
   <script>
-var _instanceId = window.location.hash.slice(1);
+const _instanceId = window.location.hash.slice(1);
 
-var worker = new Worker("jailed.js");
-worker.onerror = function (event) {
+const worker = new Worker('jailed.js');
+worker.onerror = (event) => {
     window.parent.postMessage({
-        type: "error",
+        type: 'error',
+        errtype: 'internal',
         id: _instanceId,
         message: event.message,
         filename: event.filename,
-        lineno: event.lineno},"*");
+        lineno: event.lineno},'*');
 };
 
-worker.onmessage = function (event) {
-    window.parent.postMessage(Object.assign(event.data,{id: _instanceId}),"*");
+worker.onmessage = (event) => {
+    window.parent.postMessage(Object.assign(event.data,{id: _instanceId}),'*');
 };
 
-window.addEventListener("message",function (event) {
+window.addEventListener('message',(event) => {
     worker.postMessage(event.data);
 },false);
-
-window.parent.postMessage({type: "getargs",id: _instanceId},"*");
   </script>
 </head>
 <body></body>
