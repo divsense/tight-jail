@@ -9,6 +9,16 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <node.h>
+
+
+#if V8_MAJOR_VERSION >= 7
+#  define STRING_UTF8LENGTH(str,isolate) ((str)->Utf8Length(isolate))
+#  define STRING_WRITEUTF8(str,isolate,data) ((str)->WriteUtf8(isolate,data))
+#else
+#  define STRING_UTF8LENGTH(str,isolate) ((str)->Utf8Length())
+#  define STRING_WRITEUTF8(str,isolate,data) ((str)->WriteUtf8(data))
+#endif
 
 
 uv_loop_t *loop;
@@ -355,8 +365,8 @@ public:
 
     void add_string(v8::Isolate* isolate,const v8::String *str) {
         size_t length = buffer.size();
-        buffer.insert(buffer.end(),str->Utf8Length(isolate),0);
-        str->WriteUtf8(isolate,buffer.data() + length);
+        buffer.insert(buffer.end(),STRING_UTF8LENGTH(str,isolate),0);
+        STRING_WRITEUTF8(str,isolate,buffer.data() + length);
     }
 
     void add_integer(long i);
@@ -812,7 +822,13 @@ void signal_handler(uv_signal_t *req,int signum) {
     close_everything();
 }
 
-int main(int argc, char* argv[]) {
+
+#ifdef ALTERNATE_ENTRY
+extern "C" int jail_main
+#else
+int main
+#endif
+(int argc, char* argv[]) {
     if(argc != 2) {
         fprintf(stderr,"exactly one argument is required\n");
         return 1;
@@ -820,7 +836,7 @@ int main(int argc, char* argv[]) {
 
     v8::V8::InitializeICUDefaultLocation(argv[0]);
     v8::V8::InitializeExternalStartupData(argv[0]);
-    platform = v8::platform::CreateDefaultPlatform();
+    platform = node::CreatePlatform(8,nullptr);
     v8::V8::InitializePlatform(platform);
     v8::V8::Initialize();
 
