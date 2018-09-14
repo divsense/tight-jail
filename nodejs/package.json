@@ -1,6 +1,6 @@
 {
   "name": "tight-jail",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Execute untrusted JavaScript securely",
   "main": "index.js",
   "files": [
@@ -9,7 +9,8 @@
     "test/*"
   ],
   "scripts": {
-    "test": "mocha"
+    "test": "mocha",
+    "postinstall": "node scripts/compile.js"
   },
   "repository": {
     "type": "git",
@@ -27,6 +28,13 @@
   "homepage": "https://github.com/divsense/tight-jail#readme",
   "dependencies": {
     "byline": "^5.0.0",
-    "fs-extra": "^7.0.0"
+    "fs-extra": "^7.0.0",
+    "request": "^2.88.0",
+    "request-promise-native": "^1.0.5"
+  },
+  "devDependencies": {
+    "chai": "^4.1.2",
+    "chai-as-promised": "^7.1.1",
+    "mocha": "^5.2.0"
   }
 }

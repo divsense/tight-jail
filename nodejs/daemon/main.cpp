@@ -9,7 +9,6 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
-#include <node.h>
 
 
 #if V8_MAJOR_VERSION >= 7
@@ -251,7 +250,7 @@ struct request_task : private list_node, public v8::Task {
         for(auto &t : tasks) {
             if(!cc || cc == t->client) {
                 delete t;
-                cc = nullptr;
+                t = nullptr;
             }
         }
         purge_nulls();
@@ -822,13 +821,7 @@ void signal_handler(uv_signal_t *req,int signum) {
     close_everything();
 }
 
-
-#ifdef ALTERNATE_ENTRY
-extern "C" int jail_main
-#else
-int main
-#endif
-(int argc, char* argv[]) {
+int main(int argc, char* argv[]) {
     if(argc != 2) {
         fprintf(stderr,"exactly one argument is required\n");
         return 1;
@@ -836,7 +829,7 @@ int main
 
     v8::V8::InitializeICUDefaultLocation(argv[0]);
     v8::V8::InitializeExternalStartupData(argv[0]);
-    platform = node::CreatePlatform(8,nullptr);
+    platform = v8::platform::CreateDefaultPlatform();
     v8::V8::InitializePlatform(platform);
     v8::V8::Initialize();
 

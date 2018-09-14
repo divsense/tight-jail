@@ -1,11 +1,13 @@
 'use strict';
 
 const net = require('net');
+const path = require('path');
 const child_process = require('child_process');
 const request = require('request-promise-native');
 
 
-const SERVER_PATH = 'jsjaild';
+const SERVER_DIR = path.join(__dirname,'daemon');
+const SERVER_PATH = path.join(SERVER_DIR,'jsjaild');
 const PIPE_BASENAME = '\\\\?\\pipe\\js-jail.';
 
 
@@ -71,14 +73,19 @@ class JailConnection {
             
             if(!JailConnection._server_proc) {
                 //console.log('starting jail process');
-                
+
+                let options = {
+                    stdio: ['ignore','pipe','inherit'],
+                    cwd: SERVER_DIR,
+                    windowsHide: true
+                };
+                if(JailConnection._uid !== null) options.uid = JailConnection._uid;
+                if(JailConnection._gid !== null) options.gid = JailConnection._gid;
+
                 JailConnection._server_proc = child_process.spawn(
                     SERVER_PATH,
                     [JailConnection._getSocketName()],
-                    {
-                        stdio: ['ignore','pipe','inherit'],
-                        windowsHide: true
-                    });
+                    options);
                 
                 JailConnection._server_proc.stdout.once('data',(data) => {
                     //console.log('jail process ready');
@@ -178,21 +185,21 @@ class JailConnection {
                 else this._pendingRequests.push([req,[resolve,reject]]);
             });
     }
-    
+
     /**
      * Return a promise to create a new JavaScript context and return its ID.
      */
     createContext() {
         return this.request('{"type":"createcontext"}');
     }
-    
+
     /**
      * Return a promise to Destroy a previously created context.
      */
     destroyContext(context) {
         return this.request({type: "destroycontext",context: context});
     }
-    
+
     /**
      * Return a promise to evaluate a string containing JavaScript code and
      * return the result.
@@ -202,7 +209,7 @@ class JailConnection {
         if(context !== null) msg.context = context;
         return this.request(msg);
     }
-    
+
     /**
      * Return a promise to execute a string containing JavaScript code.
      */
@@ -211,7 +218,7 @@ class JailConnection {
         if(context !== null) msg.context = context;
         return this.request(msg);
     }
-    
+
     /**
      * Return a promise to execute a JavaScript function.
      */
@@ -220,7 +227,7 @@ class JailConnection {
         if(context !== null) msg.context = context;
         return this.request(msg);
     }
-    
+
     /**
      * Return a promise to execute a remote JavaScript file.
      */
@@ -231,7 +238,7 @@ class JailConnection {
             return this.request(msg);
         });
     }
-    
+
     /**
      * Destroy the connection to the jail process.
      * 
@@ -249,25 +256,9 @@ class JailConnection {
             delete JailConnection._pending_init[JailConnection._pending_init.indexOf(this)];
         }
     }
-    
+
     isPending() {
         return (this._server ? this._requestQueue : this._pendingRequests).length != 0;
-    }
-    
-    /**
-     * If JailConnection launched a process, this will stop it. Otherwise this
-     * has no effect.
-     * 
-     * Creating a new instance of JailConnection after calling shutdown() will
-     * re-launch the process.
-     */
-    static shutdown() {
-        if(JailConnection._server_proc)
-            JailConnection._server_proc.kill('SIGINT');
-        
-        JailConnection._proc_ready = false;
-        JailConnection._server_proc = null;
-        JailConnection._pending_init = [];
     }
 }
 
@@ -275,8 +266,35 @@ JailConnection._socketName = null;
 JailConnection._proc_ready = false;
 JailConnection._server_proc = null;
 JailConnection._pending_init = [];
+JailConnection._uid = null;
+JailConnection._gid = null;
 
 exports.JailConnection = JailConnection;
+
+
+function setProcUser(uid=null,gid=null) {
+    JailConnection._uid = uid;
+    JailConnection._gid = gid;
+}
+exports.setProcUser = setProcUser;
+
+
+/**
+ * If JailConnection launched a process, this will stop it. Otherwise this
+ * has no effect.
+ * 
+ * Creating a new instance of JailConnection after calling shutdown() will
+ * re-launch the process.
+ */
+function shutdown() {
+    if(JailConnection._server_proc)
+        JailConnection._server_proc.kill('SIGINT');
+
+    JailConnection._proc_ready = false;
+    JailConnection._server_proc = null;
+    JailConnection._pending_init = [];
+}
+exports.shutdown = shutdown;
 
 
 class JailContext {
@@ -284,32 +302,32 @@ class JailContext {
         this._connection = new JailConnection(autoClose);
         this._pendingRequests = [];
         this._contextId = null;
-        
-        this._connection.createContext().then((id) => {
+
+        this._connection.createContext().then(id => {
             this._contextId = id;
             for(let r of this._pendingRequests)
-                this._dispatchRequests(r[0]).then(r[1][0],r[1][1]);
+                this._dispatchRequest(r[0]).then(r[1][0],r[1][1]);
             this._pendingRequests = null;
         });
     }
-    
+
     get autoClose() { return this._connection.autoClose; }
     set autoClose(val) { this._connection.autoClose = val; }
-    
-    _dispatchRequest(req,resolve,reject) {
+
+    _dispatchRequest(req) {
         req.context = this._contextId;
         return this._connection.request(req);
     }
-    
+
     _request(req) {
-        if(this._connectionId === null)
+        if(this._contextId === null)
             return new Promise((resolve,reject) => {
-                this._pendingRequests.push(req,[resolve,reject]);
+                this._pendingRequests.push([req,[resolve,reject]]);
             });
         else
-            this._dispatchRequest(req);
+            return this._dispatchRequest(req);
     }
-    
+
     /**
      * Return a promise to evaluate a string containing JavaScript code and
      * return the result.
@@ -355,7 +373,7 @@ exports.JailContext = JailContext;
 
 
 function evalJailed(code) {
-    return (new JailContext(true)).eval(code);
+    return (new JailConnection(true)).eval(code);
 }
 exports.evalJailed = evalJailed;
 

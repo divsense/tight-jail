@@ -1,0 +1,6 @@
+node_modules
+nodejs/daemon/*.so
+nodejs/daemon/*.dll
+nodejs/daemon/*.dat
+nodejs/daemon/*.bin
+nodejs/daemon/jsjaild
