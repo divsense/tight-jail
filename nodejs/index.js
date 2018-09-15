@@ -15,9 +15,7 @@ class JailError extends Error {}
 JailError.prototype.name = 'JailError';
 exports.JailError = JailError;
 
-/**
- * Something went wrong in the jail process.
- */
+/** Something went wrong in the jail process. */
 class InternalJailError extends JailError {}
 InternalJailError.prototype.name = "InternalJailError";
 exports.InternalJailError = InternalJailError;
@@ -56,7 +54,7 @@ exports.ClientError = ClientError;
 /**
  * A connection to the jail process.
  * 
- * This class does not have a browser-side equivalent. For client-server
+ * This class does not have a browser-side equivalent. For browser
  * compatible code, use JailContext instead.
  */
 class JailConnection {
@@ -69,7 +67,7 @@ class JailConnection {
         if(JailConnection._proc_ready) {
             this._init_connection();
         } else {
-            JailConnection._pending_init.push(this);
+            JailConnection._pending_init.add(this);
             
             if(!JailConnection._server_proc) {
                 //console.log('starting jail process');
@@ -91,7 +89,7 @@ class JailConnection {
                     //console.log('jail process ready');
                     
                     JailConnection._proc_ready = true;
-                    for(let inst of JailConnection._pending_init) inst._init_connection();
+                    JailConnection._pending_init.forEach(inst => { inst._init_connection(); });
                     JailConnection._pending_init = null;
                 });
             }
@@ -101,10 +99,15 @@ class JailConnection {
     static _getSocketName() {
         if(!JailConnection._socketName) {
             JailConnection._socketName = process.platform == 'win32' ?
-                    PIPE_BASENAME + require('process').pid :
+                    PIPE_BASENAME + process.pid :
                     require('tmp').tmpNameSync({template: '/tmp/jsjail-socket.XXXXXX'});
         }
         return JailConnection._socketName;
+    }
+    
+    _rejectRequests(e) {
+        for(let r of this._requestQueue) r[1](e);
+        this._requestQueue = null;
     }
     
     _init_connection() {
@@ -112,11 +115,15 @@ class JailConnection {
         this._server.setEncoding('utf8');
         
         this._server.on('error',(e) => {
+            this._server.removeAllListeners('close');
             this._server = null;
             if(!(e instanceof JailError)) e = new DisconnectJailError(e.message);
  
-            for(let r of this._requestQueue) r[1](e);
-            this._requestQueue = null;
+            this._rejectRequests(e);
+        });
+        
+        this._server.on('close',() => {
+            this._rejectRequests(new DisconnectJailError('connection to jail process closed unexpectedly'));
         });
         
         let buffer = '';
@@ -245,16 +252,21 @@ class JailConnection {
      * This will cause pending requests to be rejected with an instance of
      * ClosedJailError.
      */
-    close() {
+    close(extra_cb=null) {
         const e = new ClosedJailError('the connection has been destroyed');
+        if(extra_cb) extra_cb(e);
+        
         if(this._server) {
             this._server.destroy(e);
-            this._server = null;
         } else if(this._pendingRequests !== null) {
             for(let p of this._pendingRequests) p[1][1](e);
             this._pendingRequests = null;
-            delete JailConnection._pending_init[JailConnection._pending_init.indexOf(this)];
+            JailConnection._pending_init.delete(this);
         }
+    }
+    
+    getStats() {
+        return this.request('{"type":"getstats"}');
     }
 
     isPending() {
@@ -265,7 +277,7 @@ class JailConnection {
 JailConnection._socketName = null;
 JailConnection._proc_ready = false;
 JailConnection._server_proc = null;
-JailConnection._pending_init = [];
+JailConnection._pending_init = new Set();
 JailConnection._uid = null;
 JailConnection._gid = null;
 
@@ -287,12 +299,15 @@ exports.setProcUser = setProcUser;
  * re-launch the process.
  */
 function shutdown() {
-    if(JailConnection._server_proc)
+    if(JailConnection._server_proc) {
         JailConnection._server_proc.kill('SIGINT');
+        if(JailConnection._pending_init)
+            JailConnection._pending_init.forEach(inst => { inst.close(); });
+    }
 
     JailConnection._proc_ready = false;
     JailConnection._server_proc = null;
-    JailConnection._pending_init = [];
+    JailConnection._pending_init = new Set();
 }
 exports.shutdown = shutdown;
 
@@ -308,7 +323,16 @@ class JailContext {
             for(let r of this._pendingRequests)
                 this._dispatchRequest(r[0]).then(r[1][0],r[1][1]);
             this._pendingRequests = null;
+        },e => {
+            this._rejectPending(e);
         });
+    }
+    
+    _rejectPending(e) {
+        if(this._pendingRequests) {
+            for(let r of this._pendingRequests) r[1][1](e);
+            this._pendingRequests = null;
+        }
     }
 
     get autoClose() { return this._connection.autoClose; }
@@ -366,8 +390,10 @@ class JailContext {
      * ClosedJailError.
      */
     close() {
-        this._connection.close();
+        this._connection.close(e => { this._rejectPending(e); });
     }
+    
+    getStats() { return this._connection.getStats(); }
 }
 exports.JailContext = JailContext;
 

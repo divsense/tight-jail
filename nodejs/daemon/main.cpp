@@ -6,6 +6,7 @@
 #include <map>
 #include <algorithm>
 #include <utility>
+#include <atomic>
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
@@ -96,6 +97,9 @@ struct client_connection : private list_node {
     typedef std::map<unsigned long,v8::UniquePersistent<v8::Context>> context_map;
 
     static client_connection *conn_head;
+    
+    // used for "getstats"
+    static std::atomic<unsigned long> conn_count;
 
     uv_pipe_t client;
     v8::Isolate* isolate;
@@ -140,10 +144,12 @@ struct client_connection : private list_node {
 
         if(conn_head) conn_head->insert_before(this);
         conn_head = this;
+        ++conn_count;
     }
 
     ~client_connection() {
         assert(!requests_head);
+        --conn_count;
         remove();
         if(this == conn_head) conn_head = nullptr;
 
@@ -172,6 +178,7 @@ struct client_connection : private list_node {
 };
 
 client_connection *client_connection::conn_head = nullptr;
+std::atomic<unsigned long> client_connection::conn_count{0};
 
 v8::Local<v8::String> client_connection::get_str(unsigned int i) {
     assert(i < COUNT_STR);
@@ -274,8 +281,8 @@ struct request_task : private list_node, public v8::Task {
     ~request_task() {
         remove();
         if(client->requests_head == this) {
+            client->requests_head = nullptr;
             if(client->closed) delete client;
-            else client->requests_head = nullptr;
         }
     }
 
@@ -592,13 +599,7 @@ void request_task::Run() {
             client->get_str(client_connection::STR_TYPE)))->ToString(request_context));
 
 
-        /*if(type->StrictEquals(client->get_str(client_connection::STR_LOAD_SCRIPT))) {
-            Local<String> uri = check_r(check_r(msg->Get(
-                client->get_str(client_connection::STR_URI)))->ToString(request_context));
-            auto context = get_context(client,msg);
-            Context::Scope context_scope(context.second);
-        }
-        else */if(type->StrictEquals(client->get_str(client_connection::STR_EVAL))) {
+        if(type->StrictEquals(client->get_str(client_connection::STR_EVAL))) {
             Local<String> code = check_r(check_r(
                 msg->Get(client->get_str(client_connection::STR_CODE)))->ToString(request_context));
             auto context = get_context(client,msg);
@@ -699,9 +700,13 @@ void request_task::Run() {
                 ("context",id).send(stream);
         }
         else if(type->StrictEquals(client->get_str(client_connection::STR_GETSTATS))) {
-            response_builder{client->isolate}
-                ("type","\"result\"")
-                ("value","{}").send(stream);
+            string_builder b;
+            b.add_string(R"({"type":"result","value":{"connections":)");
+            b.add_integer(client_connection::conn_count.load());
+            b.add_string("}}");
+            queue_response(
+                stream,
+                b.get_string());
         }
         else {
             if(!client->is_closing())
