@@ -68,14 +68,20 @@ struct list_node {
 
     void insert_before(list_node *node) {
         assert(!(node->next || node->prev));
-        if(prev) prev->next = node;
+        if(prev) {
+            prev->next = node;
+            node->prev = prev;
+        }
         node->next = this;
         prev = node;
     }
 
     void insert_after(list_node *node) {
         assert(!(node->next || node->prev));
-        if(next) next->prev = node;
+        if(next) {
+            next->prev = node;
+            node->next = next;
+        }
         node->prev = this;
         next = node;
     }
@@ -148,10 +154,10 @@ struct client_connection : private list_node {
     }
 
     ~client_connection() {
-        assert(!requests_head);
+        assert(!requests_head && is_closing());
         --conn_count;
+        if(this == conn_head) conn_head = static_cast<client_connection*>(next);
         remove();
-        if(this == conn_head) conn_head = nullptr;
 
         /* all the JS references need to be freed before calling
            isolate->Dispose */
@@ -279,11 +285,9 @@ struct request_task : private list_node, public v8::Task {
     }
 
     ~request_task() {
+        if(client->requests_head == this) client->requests_head = static_cast<request_task*>(next);
         remove();
-        if(client->requests_head == this) {
-            client->requests_head = nullptr;
-            if(client->closed) delete client;
-        }
+        if(!client->requests_head && client->closed) delete client;
     }
 
     void Run() override;
@@ -819,6 +823,12 @@ void close_everything() {
     client_connection::close_all();
     uv_close(reinterpret_cast<uv_handle_t*>(&server),nullptr);
     uv_close(reinterpret_cast<uv_handle_t*>(&request_task::work_dispatcher),nullptr);
+    
+    /* With everything closed, the loop should stop on its own. When debugging,
+       we force the loop to end and print anything that didn't get closed. */
+#ifndef NDEBUG
+    uv_stop(loop);
+#endif
 }
 
 void signal_handler(uv_signal_t *req,int signum) {

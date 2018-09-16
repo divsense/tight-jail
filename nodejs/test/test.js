@@ -12,6 +12,18 @@ function commonTests(C) {
         var result = await (new C(true)).eval('3 * 6');
         assert.equal(result,18);
     });
+    
+    it('should be closed automatically when autoClose is true',async function () {
+        var j = new C();
+        try {
+            var ccount = (await j.getStats()).connections;
+            var result = await (new C(true)).eval('2 + 2');
+            assert.equal(result,4);
+            while((await j.getStats()).connections != ccount) sleep(10);
+        } finally {
+            j.close();
+        }
+    });
 
     it('should terminate execution upon closing a connection',async function() {
         var j1 = new C();

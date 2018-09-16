@@ -58,7 +58,8 @@ exports.ClientError = ClientError;
  * compatible code, use JailContext instead.
  */
 class JailConnection {
-    constructor() {
+    constructor(autoClose=false) {
+        this.autoClose = autoClose;
         this._server = null;
         this._pendingRequests = [];
         this._requestQueue = [];
@@ -314,7 +315,8 @@ exports.shutdown = shutdown;
 
 class JailContext {
     constructor(autoClose=false) {
-        this._connection = new JailConnection(autoClose);
+        this._autoClose = autoClose;
+        this._connection = new JailConnection();
         this._pendingRequests = [];
         this._contextId = null;
 
@@ -323,20 +325,18 @@ class JailContext {
             for(let r of this._pendingRequests)
                 this._dispatchRequest(r[0]).then(r[1][0],r[1][1]);
             this._pendingRequests = null;
+            this._connection.autoClose = this._autoClose;
         },e => {
             this._rejectPending(e);
         });
     }
-    
+
     _rejectPending(e) {
         if(this._pendingRequests) {
             for(let r of this._pendingRequests) r[1][1](e);
             this._pendingRequests = null;
         }
     }
-
-    get autoClose() { return this._connection.autoClose; }
-    set autoClose(val) { this._connection.autoClose = val; }
 
     _dispatchRequest(req) {
         req.context = this._contextId;
@@ -359,7 +359,7 @@ class JailContext {
     eval(code) {
         return this._request({type: "eval",code: code});
     }
-    
+
     /**
      * Return a promise to execute a string containing JavaScript code.
      */
@@ -373,7 +373,7 @@ class JailContext {
     call(func,args=[]) {
         return this._request({type: "call",func: func,args: args});
     }
-    
+
     /**
      * Return a promise to execute a remote JavaScript file.
      */
@@ -382,7 +382,7 @@ class JailContext {
             return this._request({type: "exec",code: code});
         });
     }
-    
+
     /**
      * Destroy the connection to the jail process.
      * 
@@ -392,7 +392,7 @@ class JailContext {
     close() {
         this._connection.close(e => { this._rejectPending(e); });
     }
-    
+
     getStats() { return this._connection.getStats(); }
 }
 exports.JailContext = JailContext;
