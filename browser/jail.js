@@ -3,7 +3,7 @@ class JailError extends Error {}
 JailError.prototype.name = 'JailError';
 
 /**
- * Something went wrong in the jail process.
+ * Something went wrong in the jail IFRAME.
  */
 class InternalJailError extends JailError {}
 InternalJailError.prototype.name = "InternalJailError";
@@ -16,11 +16,7 @@ RequestJailError.prototype.name = "RequestJailError";
 class ResultJailError extends JailError {}
 ResultJailError.prototype.name = "ResultJailError";
 
-/** The jail process didn't have enough memory to complete an action. */
-class MemoryJailError extends InternalJailError {}
-MemoryJailError.prototype.name = "MemoryJailError";
-
-/** An error occurred with socket or pipe connection to the jail process. */
+/** The connection to the jail was lost. */
 class DisconnectJailError extends JailError {}
 DisconnectJailError.prototype.name = "DisconnectJailError";
 

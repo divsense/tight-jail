@@ -202,7 +202,7 @@ class JailConnection {
     }
 
     /**
-     * Return a promise to Destroy a previously created context.
+     * Return a promise to destroy a previously created context.
      */
     destroyContext(context) {
         return this.request({type: "destroycontext",context: context});
