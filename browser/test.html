@@ -2,76 +2,87 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <style type="text/css">
-    .error { color: red; }
-  </style>
-  <script src="jail.js"></script>
+  <title>Mocha Tests</title>
+  <link href="https://unpkg.com/mocha@5.2.0/mocha.css" rel="stylesheet">
 </head>
 <body>
-  <h1>Test</h1>
-  <div>
-    <input type="radio" id="script_input" name="input_type" value="script">
-    <label for="script">JavaScript file</label>
-    <input type="text" id="script_input_val" name="script_input_val">
-  </div>
-  <div>
-    <input type="radio" checked id="text_input" name="input_type" value="text">
-    <label for="script">text input</label>
-    <textarea cols="30" id="text_input_val" name="text_input_val">
-function main(a,b,c) {
-    return (a + b) * c;
-}
-    </textarea>
-  </div>
-  <div>
-    <label for="arguments">arguments</label>
-    <input type="text" id="arguments" name="arguments" value="3,5,7">
-  </div>
-  <div>
-    <button id="exc_button">Execute</button>
-    <button id="stop_button" disabled>Cancel</button>
-  </div>
-  <div><h3>result:</h3><div id="result">
-  </div></div>
+  <div id="mocha"></div>
+  <script src="https://unpkg.com/chai/chai.js"></script>
+  <script src="https://unpkg.com/mocha@5.2.0/mocha.js"></script>
+  <script>mocha.setup({ui:'bdd',timeout:2000});</script>
+  <script src="tightjail.js"></script>
   <script>
-var exc_button = document.getElementById("exc_button");
-var stop_button = document.getElementById("stop_button");
-var jail = null;
+const assert = chai.assert;
 
-function report_result(success,value) {
-    var res_div = document.getElementById("result");
-    res_div.innerHTML = "";
-    if(success) {
-        res_div.className = "";
-        res_div.appendChild(new Text(value.toString()));
-    } else {
-        res_div.className = "error";
-        res_div.appendChild(new Text(value.message));
-    }
-    exc_button.disabled = false;
-    stop_button.disabled = true;
+function sleep(ms) {
+    return new Promise(resolve => { setTimeout(resolve,ms); });
 }
 
-exc_button.addEventListener("click",function(event) {
-    var args = eval("[" + document.getElementById("arguments").value + "]");
-    jail = new JailContext(true);
-    if(document.getElementById("script_input").checked) {
-        jail.execURI(document.getElementById("script_input_val").value);
-    } else {
-        jail.exec(document.getElementById("text_input_val").value);
-    }
-    jail.call('main',args)
-        .then((r) => { report_result(true,r); })
-        .catch((e) => { report_result(false,e); });
-    exc_button.disabled = true;
-    stop_button.disabled = false;
-},false);
+describe('tight-jail',function () {
+    describe('JailContext',function () {
+        //commonTests(jail.JailContext);
+        it('should be able to evaluate JavaScript',async function () {
+            var result = await (new tightjail.JailContext(true)).eval('3 * 6');
+            assert.equal(result,18);
+        });
 
-stop_button.addEventListener("click",function(event) {
-    jail.close();
-    exc_button.disabled = false;
-    stop_button.disabled = true;
+        it('should be closed automatically when autoClose is true',async function () {
+            var j = new tightjail.JailContext();
+            try {
+                var ccount = (await j.getStats()).connections;
+                var result = await (new tightjail.JailContext(true)).eval('2 + 2');
+                assert.equal(result,4);
+                while((await j.getStats()).connections != ccount) await sleep(10);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should terminate execution upon closing a connection',async function() {
+            var j1 = new tightjail.JailContext();
+            try {
+                var ccount1 = (await j1.getStats()).connections;
+                var j2 = new tightjail.JailContext();
+                try {
+                    await j2.eval('2 + 2'); // wait for j2 to be usable
+                    assert.notEqual((await j1.getStats()).connections,ccount1);
+
+                    var j2p = j2.exec('while(true);');
+                } finally {
+                    j2.close();
+                }
+                try {
+                    await j2p;
+                    assert.assert(false,"j2p did not reject");
+                } catch(e) {
+                    assert.instanceOf(e,tightjail.ClosedJailError);
+                }
+                while((await j1.getStats()).connections != ccount1) await sleep(10);
+            } finally {
+                j1.close();
+            }
+        });
+
+        it('should be able to call functions',async function () {
+            var result = await (new tightjail.JailContext(true)).call('eval',['5 + 6']);
+            assert.equal(result,11);
+        });
+
+        it('should retain state',async function () {
+            var j = new tightjail.JailContext();
+            try {
+                await j.exec('var x = "hello"');
+                var result = await j.eval('x');
+                assert.equal(result,'hello');
+            } finally {
+                j.close();
+            }
+        });
+    });
 });
+
+mocha.checkLeaks();
+mocha.run();
   </script>
 </body>
 </html>

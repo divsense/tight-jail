@@ -12,11 +12,17 @@ const CONFIG_LOG_NAME = 'cfg_test_log.txt';
 const OUTPUTNAMEBASE = 'jsjaild';
 const SOURCE_DEST_FOLDER = 'daemon';
 const SOURCE = 'main.cpp';
-const TOOLSETS = ['clang','gcc','msvc'];
+const TOOLSETS = ['clang','gcc','msvc','none'];
 
 // v8 builds its own libc++
-const v8_libs = ['v8','v8_libbase','v8_libplatform','icuuc','icui18n','c++'];
-const v8_ninja_names = ['v8','v8_libbase','v8_libplatform','icuuc','icui18n','libc++'];
+const v8_libs = ['v8','v8_libbase','v8_libplatform','icui18n','icuuc','c++']; 
+const v8_ninja_names = ['v8','v8_libbase','v8_libplatform','icui18n','icuuc','libc++'];
+const v8_libcpp_dirs = [
+    path.join('obj','buildtools','third_party','libc++','libc++'),
+    path.join('obj','buildtools','third_party','libc++abi','libc++abi')];
+const v8_monolithic = 'v8_monolith';
+const libv8_i = v8_libs.indexOf('v8');
+const libcpp_i = v8_libs.indexOf('c++');
 
 let v8_ninja_lookup = {};
 for(let i=0; i<v8_ninja_names.length; ++i)
@@ -40,7 +46,7 @@ const msvc_config = {
     CXXFLAGS: '/Ox /EHc /GL /GS /volatile:iso /Wall',
     CPPFLAGS: '/DNDEBUG',
     LDFLAGS: '/MT',
-    LDLIBS: 'uv.lib v8.lib v8_libbase.lib v8_libplatform.lib icuuc.lib icui18n.lib',
+    LDLIBS: 'uv.lib',
     NAME_FLAG: '/Fe',
     PREPROCESS_FLAG: '/EP',
     INCLUDEPATH_FLAG: '/I',
@@ -65,7 +71,7 @@ function execShell(command,options,resolve,reject,retFunc = null) {
         args = ['-c',command];
     }
     var r = child_process.spawn(shell,args,options);
-    
+
     var onExit = (code,signal) => {
         if(code !== null) {
             if(code == 0) resolve(retFunc && retFunc());
@@ -73,12 +79,12 @@ function execShell(command,options,resolve,reject,retFunc = null) {
         } else reject(new ChildError('child process was terminated'));
     };
     r.on('exit',onExit);
-    
+
     r.on('error',(e) => {
         sh.removeListener('exit',onExit);
         reject(e);
     });
-    
+
     return r;
 }
 
@@ -97,7 +103,7 @@ class ConfigEnv {
             this.log_f = fs.openSync(CONFIG_LOG_NAME,'w');
         } catch(e) {
             console.log(`unable to create log file ${CONFIG_LOG_NAME}`);
-        }    
+        }
         try {
             this.tempDir = fs.mkdtempSync(path.join(os.tmpdir(),'config'));
         } catch(e) {
@@ -112,21 +118,21 @@ class ConfigEnv {
             throw e;
         }
     }
-    
+
     relPath(x) {
         return path.join(this.oldDir,x);
     }
-    
+
     nextTestNo() {
         return this.testNo++;
     }
-    
+
     close() {
         process.chdir(this.oldDir);
         if(this.log_f) fs.closeSync(this.log_f);
         fs.removeSync(this.tempDir);
     }
-    
+
     newTestWithInputFile(input,postfix = '') {
         var name = path.join(this.tempDir,'_' + this.nextTestNo() + postfix);
         var fd = fs.openSync(name,'w');
@@ -134,21 +140,21 @@ class ConfigEnv {
         fs.closeSync(fd);
         return name;
     }
-    
+
     logCommand(command,input) {
         if(this.log_f) {
             fs.writeSync(this.log_f,`Attempting to run:\n${command}\nwith input:\n${input}\n`);
         }
     }
-    
+
     getPreprocessedLine(cfg,input) {
         return new Promise((resolve,reject) => {
             var input_fname = this.newTestWithInputFile(input,'.h');
-            
+
             var command = `${cfg.CXX} ${cfg.PREPROCESS_FLAG} ${cfg.CPPFLAGS} ${input_fname}`;
-            
+
             this.logCommand(command,input);
-            
+
             var lastLine = '';
             var sh = execShell(
                 command,
@@ -156,20 +162,20 @@ class ConfigEnv {
                 resolve,
                 reject,
                 () => lastLine);
-            
+
             sh.stdout.setEncoding('utf8');
             byline.createStream(sh.stdout).on('data',(line) => { lastLine = line; });
         });
     }
-    
+
     verifyCompile(cfg,input) {
         return new Promise((resolve,reject) => {
             var input_fname = this.newTestWithInputFile(input,'.cpp');
-            
+
             var command = `${cfg.CXX} ${cfg.CPPFLAGS} ${cfg.CXXFLAGS} ${cfg.LDFLAGS} ${input_fname}`;
-            
+
             this.logCommand(command,input);
-            
+
             execShell(
                 command,
                 {stdio: ['ignore','ignore',this.log_f]},
@@ -192,6 +198,27 @@ function stripSuffix(x,suf) {
     return x.endsWith(suf) ? x.slice(0,-suf.length) : x;
 }
 
+function coalesce_str(...parts) {
+    return parts.filter(x => !!x).join(' ');
+}
+
+function coalesce_str_into(config,attr,...parts) {
+    config[attr] = coalesce_str(config[attr],...parts);
+}
+
+function str_to_bool(name,x) {
+    x = x.toLowerCase();
+    if(x == 'true' || x == '1') return true;
+    if(x == 'false' || x == '0') return false;
+    throw new BuildError(`${name} must be one of: true, false, 1 or 0`);
+}
+
+function files_in_folder(config,dir,suffix) {
+    return fs.readdirSync(dir)
+        .filter(name => name.endsWith(suffix))
+        .map(name => config.shell_quote(path.join(dir,name)));
+}
+
 function readNinja(config) {
     if(config.V8_BUILD_DIR) {
         return new Promise((resolve,reject) => {
@@ -199,9 +226,14 @@ function readNinja(config) {
                 fs.createReadStream(path.join(config.V8_BUILD_DIR,'build.ninja')));
             let root = null;
             let lpaths = new Set();
-            let libs = [];
+
+            // these need to be in the same order
+            let libs = v8_libs.map(x => null);
+
             let neededFiles = [];
             let uses_so = false;
+            let uses_a = false;
+
             buildn.on('data',(line) => {
                 if(!root) {
                     let m = /^ *command *=(?:.* |)--root=([^ ]+).*$/.exec(line);
@@ -210,19 +242,22 @@ function readNinja(config) {
                         return;
                     }
                 }
+
                 let m = /^build +([^$:]+) *: *phony +(.*)$/.exec(line);
                 if(m) {
-                    let lib = v8_ninja_lookup[m[1]];
-                    if(lib) {
+                    let i;
+                    if(m[1] == v8_monolithic) i = libv8_i;
+                    else i = v8_ninja_names.indexOf(m[1]);
+                    if(i != -1) {
                         let libpath = path.join(config.V8_BUILD_DIR,stripSuffix(m[2],'.TOC'));
                         if(libpath.endsWith('.a') || libpath.endsWith('.lib')) {
-                            libs.push(libpath);
+                            libs[i] = libpath;
                         } else if(libpath.endsWith('.so')) {
                             uses_so = true;
                             let base = path.basename(libpath,'.so');
                             if(base.startsWith('lib')) {
                                 lpaths.add(path.dirname(libpath));
-                                libs.push('-l'+base.slice(3));
+                                libs[i] = '-l' + base.slice(3);
                                 neededFiles.push(libpath);
                             }
                         } else if(libpath.endsWith('.dll')) {
@@ -232,12 +267,26 @@ function readNinja(config) {
                 }
             });
             buildn.on('end',() => {
-                for(let lib of libs) config.LDLIBS += ' '+lib;
-                for(let p of lpaths) config.LDFLAGS += ` ${config.LIBPATH_FLAG}${p}`;
-                if(root) config.CPPFLAGS +=
-                    ` ${config.INCLUDEPATH_FLAG}${path.join(root,'include')}`;
-                if(uses_so) config.LDFLAGS += ' ' + config.LINCLUDE_DOT;
-                
+                if(root) coalesce_str_into(config,'CPPFLAGS',
+                    config.INCLUDEPATH_FLAG + path.join(root,'include'));
+
+                coalesce_str_into(config,'LDLIBS',...libs.filter(x => x).map(config.shell_quote));
+                coalesce_str_into(
+                    config,
+                    'LDFLAGS',
+                    ...Array.from(lpaths,p => config.shell_quote(config.LIBPATH_FLAG + p)));
+
+                if(uses_so) coalesce_str_into(config,'LDFLAGS',config.LINCLUDE_DOT);
+
+                if(!libs[libcpp_i]) {
+                    for(let dir of v8_libcpp_dirs) {
+                        coalesce_str_into(
+                            config,
+                            'LDLIBS',
+                            ...files_in_folder(config,path.join(config.V8_BUILD_DIR,dir),'.o'));
+                    }
+                }
+
                 for(let af of v8_aux_files) {
                     let full = path.join(config.V8_BUILD_DIR,af);
                     if(fs.existsSync(full)) neededFiles.push(full);
@@ -247,46 +296,67 @@ function readNinja(config) {
             buildn.on('error',reject);
         });
     } else {
-        for(let lib in v8_libs) config.LDLIBS += ' '+config.make_lib(lib);
+        coalesce_str_into(config,'LDLIBS',...v8_libs.map(config.make_lib));
         return Promise.resolve([]);
     }
-}
-
-var tools = process.env.TOOLS;
-if(!(tools && tools in TOOLSETS)) {
-    tools = os.platform == 'win32' ? 'msvc' : 'gcc';
-}
-
-var config = {RUN_CHECKS:true};
-var nameFlag;
-switch(tools) {
-case 'clang':
-case 'gcc':
-    Object.assign(config,gcc_config);
-    config.CXX = tools == 'clang' ? 'clang++' : 'g++';
-    break;
-case 'msvc':
-    Object.assign(config,msvc_config);
-    config.CXX = 'cl.exe';
-    break;
-}
-
-for(let prop of ['CXXFLAGS','CPPFLAGS','LDFLAGS','LDLIBS']) {
-    let env_val = process.env[prop];
-    if(env_val) config[prop] += ' ' + env_val;
-    env_val = process.env['npm_config_'+prop];
-    if(env_val) config[prop] += ' ' + env_val;
-}
-
-for(let prop of ['CXX','NAME_FLAG','PREPROCESS_FLAG','RUN_CHECKS','V8_BUILD_DIR']) {
-    let env_val = process.env['npm_config_'+prop] || process.env[prop];
-    if(env_val) config[prop] = env_val;
 }
 
 
 (async function() {
     try {
-        let neededFiles = await readNinja(config);
+        var config = {
+            RUN_CHECKS: true,
+            CXXFLAGS: '',
+            CPPFLAGS: '',
+            LDFLAGS: '',
+            LDLIBS: '',
+            NAME_FLAG: '',
+            PREPROCESS_FLAG: '',
+            INCLUDEPATH_FLAG: '',
+            LIBPATH_FLAG: '',
+            LINCLUDE_DOT: '',
+            make_lib(x) { return x; },
+            shell_quote(x) { return `"${x}"`; }
+        };
+
+        config.tools = process.env.npm_config_TOOLS || process.env.TOOLS;
+        if(!(config.tools && config.tools in TOOLSETS)) {
+            config.tools = os.platform == 'win32' ? 'msvc' : 'gcc';
+        }
+
+        switch(config.tools) {
+        case 'clang':
+        case 'gcc':
+            Object.assign(config,gcc_config);
+            config.CXX = config.tools == 'clang' ? 'clang++' : 'g++';
+            break;
+        case 'msvc':
+            Object.assign(config,msvc_config);
+            config.CXX = 'cl.exe';
+            break;
+        case 'none':
+            break;
+        }
+
+        for(let prop of ['CXXFLAGS','CPPFLAGS','LDFLAGS']) {
+            coalesce_str_into(config,prop,process.env[prop],process.env['npm_config_'+prop]);
+        }
+
+        for(let prop of ['CXX','LDLIBS','NAME_FLAG','RUN_CHECKS','V8_BUILD_DIR']) {
+            let env_val = process.env['npm_config_'+prop] || process.env[prop];
+            if(env_val) config[prop] = env_val;
+        }
+
+        if(config.tools == 'none') config.RUN_CHECKS = false;
+        else {
+            let env_val = process.env.npm_config_RUN_CHECKS || process.env.RUN_CHECKS;
+            if(env_val) config.RUN_CHECKS = str_to_bool('RUN_CHECKS',env_val);
+        }
+
+        if(config.CXX.trim() == '') throw new BuildError('CXX is not set');
+
+        let neededFiles = [];
+        if(config.tools != 'none') neededFiles = await readNinja(config);
 
         var cenv = new ConfigEnv();
         try {
@@ -294,23 +364,23 @@ for(let prop of ['CXX','NAME_FLAG','PREPROCESS_FLAG','RUN_CHECKS','V8_BUILD_DIR'
                 await failMessage(
                     cenv.verifyCompile(config,'int main() { return 0; }'),
                     'cannot compile with current settings')
-    
+
                 let ver = JSON.parse(await failMessage(
                     cenv.getPreprocessedLine(config,'#include <v8-version.h>\n[V8_MAJOR_VERSION,V8_MINOR_VERSION]'),
                     'V8 header files not found'));
-    
+
                 if(ver[0] < 6 || (ver[0] == 6 && ver[1] < 8))
                     throw new BuildError('V8 library too old; need at least version 6.8.0');
-                
+
                 await failMessage(
                     cenv.getPreprocessedLine(config,'#include <uv.h>\n'),
                     'libuv header files not found');
             }
-            
+
             let dest = OUTPUTNAMEBASE;
             if(os.platform == 'win32') dest += '.exe';
             let src = cenv.relPath(path.join(SOURCE_DEST_FOLDER,SOURCE));
-            let command = `${config.CXX} ${config.NAME_FLAG} ${dest} ${config.CPPFLAGS} ${config.CXXFLAGS} ${config.LDFLAGS} ${config.LDLIBS} ${src}`;
+            let command = `${config.CXX} ${config.NAME_FLAG} ${dest} ${config.CPPFLAGS} ${src} ${config.CXXFLAGS} ${config.LDFLAGS} ${config.LDLIBS}`;
             console.log(command);
             await verifyExec(command,{stdio: ['ignore','inherit','inherit']});
             await fs.move(dest,cenv.relPath(path.join(SOURCE_DEST_FOLDER,dest)),ov);

@@ -1,17 +1,11 @@
 {
-  "name": "tight-jail",
+  "name": "tight-jail-nodeonly",
   "version": "0.3.1",
   "description": "Execute untrusted JavaScript securely",
   "main": "index.js",
-  "files": [
-    "daemon/main.cpp",
-    "scripts/*",
-    "test/*"
-  ],
   "scripts": {
     "test": "mocha",
-    "prepare": "node ../prepare.js .",
-    "postinstall": "node scripts/compile.js"
+    "prepare": "node ../prepare.js -DNODEONLY ."
   },
   "repository": {
     "type": "git",
@@ -28,8 +22,6 @@
   },
   "homepage": "https://github.com/divsense/tight-jail#readme",
   "dependencies": {
-    "byline": "^5.0.0",
-    "fs-extra": "^7.0.0",
     "request": "^2.88.0",
     "request-promise-native": "^1.0.5"
   },

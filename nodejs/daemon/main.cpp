@@ -223,7 +223,7 @@ struct write_request {
 };
 
 struct request_task : private list_node, public v8::Task {
-    friend class client_connection;
+    friend struct client_connection;
 
     /* libuv already queues tasks for a set number of worker threads, but tasks
        that belong to the same v8::Isolate instance must not be run
@@ -730,12 +730,12 @@ void request_task::Run() {
         if(!client->is_closing())
             queue_response(
                 stream,
-                copy_string(R"({"type":"error","errtype":"request","message":"no such context"})"));
+                copy_string(R"({"type":"error","errtype":"context","message":"no such context"})"));
     } catch(...) {
         if(!client->is_closing())
             queue_response(
                 stream,
-                copy_string(R"({"type":"error","errtype":"internal","message":"unexpected error"})"));
+                copy_string(R"({"type":"error","errtype":"internal","message":"unexpected error type"})"));
     }
 
     client->running = false;

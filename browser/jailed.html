@@ -6,10 +6,9 @@
 const _instanceId = window.location.hash.slice(1);
 
 const worker = new Worker('jailed.js');
-worker.onerror = (event) => {
+worker.onerror = event => {
     window.parent.postMessage({
         type: 'error',
-        errtype: 'internal',
         id: _instanceId,
         message: event.message,
         filename: event.filename,
@@ -20,7 +19,7 @@ worker.onmessage = (event) => {
     window.parent.postMessage(Object.assign(event.data,{id: _instanceId}),'*');
 };
 
-window.addEventListener('message',(event) => {
+window.addEventListener('message',event => {
     worker.postMessage(event.data);
 },false);
   </script>

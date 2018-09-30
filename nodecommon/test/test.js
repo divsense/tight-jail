@@ -19,7 +19,7 @@ function commonTests(C) {
             var ccount = (await j.getStats()).connections;
             var result = await (new C(true)).eval('2 + 2');
             assert.equal(result,4);
-            while((await j.getStats()).connections != ccount) sleep(10);
+            while((await j.getStats()).connections != ccount) await sleep(10);
         } finally {
             j.close();
         }
@@ -39,7 +39,7 @@ function commonTests(C) {
                 j2.close();
             }
             await assert.isRejected(j2p,jail.ClosedJailError);
-            while((await j1.getStats()).connections != ccount1) sleep(10);
+            while((await j1.getStats()).connections != ccount1) await sleep(10);
         } finally {
             j1.close();
         }
@@ -76,6 +76,19 @@ describe('tight-jail',function () {
                 await j.exec('var x = 7',c);
                 var result = await j.eval('x',c);
                 assert.equal(result,7);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should throw ContextJailError with invalid context ids',async function () {
+            var j = new jail.JailConnection();
+            try {
+                await assert.isRejected(j.eval('2 + 2',1),jail.ContextJailError);
+                await assert.isRejected(j.destroyContext(1),jail.ContextJailError);
+                var c = await j.createContext();
+                await assert.isRejected(j.eval('2 + 2',c+1),jail.ContextJailError);
+                await assert.isRejected(j.destroyContext(c+1),jail.ContextJailError);
             } finally {
                 j.close();
             }

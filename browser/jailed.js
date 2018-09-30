@@ -26,7 +26,6 @@ onmessage = (event) => {
         default:
             postMessage({
                 type: 'error',
-                errtype: 'request',
                 message: 'unknown request type'})
         }
     } catch(e) {
