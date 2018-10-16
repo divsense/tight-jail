@@ -325,7 +325,7 @@ void queue_response(uv_stream_t *stream,char *msg,ssize_t len=-1) {
     if(len < 0) len = strlen(msg);
     auto req = new write_request(msg);
     char zero[1] = {0};
-    uv_buf_t buf[2] = {uv_buf_init(msg,static_cast<size_t>(len)),uv_buf_init(zero,1)};
+    uv_buf_t buf[2] = {uv_buf_init(msg,static_cast<unsigned int>(len)),uv_buf_init(zero,1)};
     uv_write(
         &req->req,
         stream,
@@ -396,7 +396,7 @@ void string_builder::add_escaped(const v8::String::Value &str) {
     for(int i = 0; i < str.length(); i++) {
         uint16_t c = (*str)[i];
         if(c <= 0xff) {
-            if(c <= 0x7f && isprint(c)) add_char(c);
+            if(c <= 0x7f && isprint(c)) add_char(static_cast<char>(c));
             else {
                 add_char('\\');
                 add_char('x');
@@ -465,8 +465,8 @@ struct response_builder {
         build.add_string(value);
     }
 
-    void add_part(long value) {
-        build.add_integer(value);
+    template<typename T> void add_part(T value) {
+        build.add_integer(static_cast<long>(value));
     }
 
     void add_part(v8::String *value) {
@@ -558,7 +558,7 @@ std::pair<unsigned long,v8::Local<v8::Context>> get_context(client_connection *c
 
     int64_t id = check_r(js_id->ToInteger(cc->request_context.Get(cc->isolate)))->Value();
     if(id < 0) throw bad_context{};
-    auto itr = cc->contexts.find(id);
+    auto itr = cc->contexts.find(static_cast<unsigned long>(id));
     if(itr == cc->contexts.end()) throw bad_context{};
     return std::make_pair(itr->first,itr->second.Get(cc->isolate));
 }
@@ -587,7 +587,7 @@ void request_task::Run() {
         client->request_context.Reset(client->isolate,Context::New(client->isolate));
     }
     Local<Context> request_context = client->request_context.Get(client->isolate);
-    Context::Scope context_scope(request_context);
+    Context::Scope req_context_scope(request_context);
 
     TryCatch trycatch(client->isolate);
 
@@ -656,7 +656,7 @@ void request_task::Run() {
                     Local<Value> result;
                     Local<String> json_result;
                     auto args_v = get_array_items(args);
-                    if(func->Call(context.second,context.second->Global(),args_v.size(),args_v.data()).ToLocal(&result) &&
+                    if(func->Call(context.second,context.second->Global(),static_cast<int>(args_v.size()),args_v.data()).ToLocal(&result) &&
                             JSON::Stringify(context.second,result).ToLocal(&json_result)) {
                         response_builder b{client->isolate};
                         b("type","\"result\"");
@@ -695,7 +695,7 @@ void request_task::Run() {
             int64_t id = check_r(check_r(msg->Get(client->get_str(client_connection::STR_CONTEXT)))
                 ->ToInteger(client->request_context.Get(client->isolate)))->Value();
             if(id < 0) throw bad_context{};
-            auto itr = client->contexts.find(id);
+            auto itr = client->contexts.find(static_cast<unsigned long>(id));
             if(itr == client->contexts.end()) throw bad_context{};
             client->contexts.erase(itr);
 
@@ -742,7 +742,7 @@ void request_task::Run() {
     request_task::run_dispatcher();
 }
 
-void on_new_connection(uv_stream_t *server,int status) noexcept {
+void on_new_connection(uv_stream_t *server_,int status) noexcept {
     if(status < 0) {
         fprintf(stderr,"connection error %s\n",uv_strerror(status));
         return;
@@ -757,14 +757,13 @@ void on_new_connection(uv_stream_t *server,int status) noexcept {
 #ifndef NDEBUG
     int r =
 #endif
-    uv_accept(server,reinterpret_cast<uv_stream_t*>(&cc->client));
+    uv_accept(server_,reinterpret_cast<uv_stream_t*>(&cc->client));
     assert(r == 0);
 
     uv_read_start(
         reinterpret_cast<uv_stream_t*>(&cc->client),
         [](uv_handle_t *h,size_t suggest_s,uv_buf_t *buf) {
-            buf->base = new char[suggest_s];
-            buf->len = suggest_s;
+            *buf = uv_buf_init(new char[suggest_s],static_cast<unsigned int>(suggest_s));
         },
         [](uv_stream_t *s,ssize_t read,const uv_buf_t *buf) {
             auto cc = reinterpret_cast<client_connection*>(s->data);
@@ -831,7 +830,7 @@ void close_everything() {
 #endif
 }
 
-void signal_handler(uv_signal_t *req,int signum) {
+void signal_handler(uv_signal_t*,int) {
     fprintf(stderr,"shutting down\n");
     close_everything();
 }

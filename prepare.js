@@ -67,8 +67,11 @@ function processDir(srcdir,destdir,defines) {
 
             if(entry.isDirectory()) paths.push(full);
             else if(entry.isFile() && name.endsWith('.js')) {
+                let dest = path.join(destdir,path.relative(srcdir,full));
+                let fulldestdir = path.dirname(dest);
+                if(!fs.existsSync(fulldestdir)) fs.mkdirSync(fulldestdir,{recursive: true});
                 fs.writeFileSync(
-                    path.join(destdir,path.relative(srcdir,full)),
+                    dest,
                     preprocess(fs.readFileSync(full,{encoding:'utf8'}),defines));
             }
         }

@@ -5,7 +5,6 @@ const os = require('os');
 const fs = require('fs-extra');
 const path = require('path');
 const byline = require('byline');
-const process = require('process');
 const child_process = require('child_process');
 
 const CONFIG_LOG_NAME = 'cfg_test_log.txt';
@@ -43,10 +42,10 @@ const gcc_config = {
     make_lib(x) { return '-l'+x; }};
 
 const msvc_config = {
-    CXXFLAGS: '/Ox /EHc /GL /GS /volatile:iso /Wall',
+    CXXFLAGS: '/nologo /Ox /EHsc /GL /GS /volatile:iso /W4 /wd4100 /wd4706',
     CPPFLAGS: '/DNDEBUG',
-    LDFLAGS: '/MT',
-    LDLIBS: 'uv.lib',
+    LDFLAGS: '/MT /link',
+    LDLIBS: 'libuv.lib Ws2_32.lib Advapi32.lib User32.lib Psapi.lib Iphlpapi.lib Userenv.lib',
     NAME_FLAG: '/Fe',
     PREPROCESS_FLAG: '/EP',
     INCLUDEPATH_FLAG: '/I',
@@ -65,7 +64,11 @@ function execShell(command,options,resolve,reject,retFunc = null) {
     var shell, args;
     if(os.platform == 'win32') {
         shell = process.env.COMSPEC || 'cmd.exe';
-        args = ['/c',command];
+
+        /* Node's argument escaping seems to mess up our escaping, hence the
+        need the extra quotes and windowsVerbatimArguments */
+        args = ['/D','/C','"'+command+'"'];
+        options = Object.assign({windowsVerbatimArguments: true},options || {});
     } else {
         shell = '/bin/sh';
         args = ['-c',command];
@@ -172,7 +175,7 @@ class ConfigEnv {
         return new Promise((resolve,reject) => {
             var input_fname = this.newTestWithInputFile(input,'.cpp');
 
-            var command = `${cfg.CXX} ${cfg.CPPFLAGS} ${cfg.CXXFLAGS} ${cfg.LDFLAGS} ${input_fname}`;
+            var command = `${cfg.CXX} ${cfg.CPPFLAGS} ${cfg.CXXFLAGS} ${input_fname} ${cfg.LDFLAGS}`;
 
             this.logCommand(command,input);
 
@@ -250,8 +253,12 @@ function readNinja(config) {
                     else i = v8_ninja_names.indexOf(m[1]);
                     if(i != -1) {
                         let libpath = path.join(config.V8_BUILD_DIR,stripSuffix(m[2],'.TOC'));
-                        if(libpath.endsWith('.a') || libpath.endsWith('.lib')) {
+                        if(libpath.endsWith('.a')) {
                             libs[i] = libpath;
+                        } else if(libpath.endsWith('.lib')) {
+                            libs[i] = libpath;
+                            let base = libpath.slice(0,-4);
+                            if(base.endsWith('.dll')) neededFiles.push(base);
                         } else if(libpath.endsWith('.so')) {
                             uses_so = true;
                             let base = path.basename(libpath,'.so');
@@ -260,8 +267,6 @@ function readNinja(config) {
                                 libs[i] = '-l' + base.slice(3);
                                 neededFiles.push(libpath);
                             }
-                        } else if(libpath.endsWith('.dll')) {
-                            neededFiles.push(libpath);
                         }
                     }
                 }
@@ -280,10 +285,12 @@ function readNinja(config) {
 
                 if(!libs[libcpp_i]) {
                     for(let dir of v8_libcpp_dirs) {
-                        coalesce_str_into(
-                            config,
-                            'LDLIBS',
-                            ...files_in_folder(config,path.join(config.V8_BUILD_DIR,dir),'.o'));
+                        let full = path.join(config.V8_BUILD_DIR,dir);
+                        if(fs.existsSync(full))
+                            coalesce_str_into(
+                                config,
+                                'LDLIBS',
+                                ...files_in_folder(config,path.join(config.V8_BUILD_DIR,dir),'.o'));
                     }
                 }
 
@@ -319,8 +326,13 @@ function readNinja(config) {
             shell_quote(x) { return `"${x}"`; }
         };
 
+        if(os.platform == 'win32') config.shell_quote =
+            x => '^"' + x.replace(/["^%|<>&]/,m => m == '"' ? '""' : '^'+m) + '^"';
+        else config.shell_quote =
+            x => "'" + x.replace("'","\\'") + "'";
+
         config.tools = process.env.npm_config_TOOLS || process.env.TOOLS;
-        if(!(config.tools && config.tools in TOOLSETS)) {
+        if(!(config.tools && TOOLSETS.includes(config.tools))) {
             config.tools = os.platform == 'win32' ? 'msvc' : 'gcc';
         }
 
@@ -380,7 +392,7 @@ function readNinja(config) {
             let dest = OUTPUTNAMEBASE;
             if(os.platform == 'win32') dest += '.exe';
             let src = cenv.relPath(path.join(SOURCE_DEST_FOLDER,SOURCE));
-            let command = `${config.CXX} ${config.NAME_FLAG} ${dest} ${config.CPPFLAGS} ${src} ${config.CXXFLAGS} ${config.LDFLAGS} ${config.LDLIBS}`;
+            let command = `${config.CXX} ${config.NAME_FLAG}${dest} ${config.CPPFLAGS} ${src} ${config.CXXFLAGS} ${config.LDLIBS} ${config.LDFLAGS}`;
             console.log(command);
             await verifyExec(command,{stdio: ['ignore','inherit','inherit']});
             await fs.move(dest,cenv.relPath(path.join(SOURCE_DEST_FOLDER,dest)),ov);

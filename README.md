@@ -56,6 +56,9 @@ This is similar to the second variant, but uses another Node script as the
 auxiliary executable. Unlike the second variant, this gives the code access to
 Node's libraries.
 
+You must use `setProcUser` to run the jail process under an unprivileged user
+account. Otherwise the "jailed" code will be free to wreak havoc on the system.
+
 
 ## Compiling from Source
 To build the auxiliary executable, a C++ compiler and the libuv and V8
@@ -98,6 +101,11 @@ required files from V8 to be copied to the tight-jail installation path.
 If building V8 from source, the default configuration is not suitable for
 embedding. It *must* be configured with either `is_component_build=true` or
 `v8_monolithic=true v8_use_external_startup_data=false`.
+
+If you wish to build using MSVC, you must specify `is_component_build=true`.
+Otherwise a static version of V8 is created. The V8 build system uses Clang to
+compile the library, and a static library compiled with Clang is not usable by
+MSVC.
 
 
 ## API
