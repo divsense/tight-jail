@@ -1,1 +1,1 @@
-include: samples/basic.js
+include: [samples/basic.js]
