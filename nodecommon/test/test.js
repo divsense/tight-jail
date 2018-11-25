@@ -12,7 +12,7 @@ function commonTests(C) {
         var result = await (new C(true)).eval('3 * 6');
         assert.equal(result,18);
     });
-    
+
     it('should be closed automatically when autoClose is true',async function () {
         var j = new C();
         try {
@@ -44,10 +44,20 @@ function commonTests(C) {
             j1.close();
         }
     });
-    
+
     it('should be able to call functions',async function () {
         var result = await (new C(true)).call('eval',['5 + 6']);
         assert.equal(result,11);
+    });
+
+    it('should be able to execute remote files',async function () {
+        var j = new C();
+        try {
+            await j.execURI('https://divsense.github.io/tight-jail/samples/basic.js');
+            assert.equal(await j.call('test',[4,5,6]),54);
+        } finally {
+            j.close();
+        }
     });
 }
 

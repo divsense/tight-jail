@@ -78,6 +78,16 @@ describe('tight-jail',function () {
                 j.close();
             }
         });
+
+        it('should be able to execute remote files',async function () {
+            var j = new C();
+            try {
+                await j.execURI('https://divsense.github.io/tight-jail/samples/basic.js');
+                assert.equal(await j.call('test',[4,5,6]),54);
+            } finally {
+                j.close();
+            }
+        });
     });
 });
 

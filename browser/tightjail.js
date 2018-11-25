@@ -26,6 +26,14 @@ DisconnectJailError.prototype.name = "ClosedJailError";
 class ClientError extends Error {}
 ClientError.prototype.name = "ClientError";
 
+class Importer {
+    load(name) { return null; }
+
+    constructor() {
+        this._modCache = new Map();
+    }
+}
+
 class JailContext {
     static uniqueId() {
         /* a random number is tacked on to prevent anyone from relying on the ID
@@ -42,8 +50,9 @@ class JailContext {
         return f;
     }
 
-    constructor(autoClose=false) {
+    constructor(autoClose=false,importer=null) {
         this.autoClose = autoClose;
+        this.importer = importer || new Importer();
         this._frameReady = false;
         this._id = JailContext.uniqueId();
 
@@ -65,26 +74,65 @@ class JailContext {
         JailContext._jails.set(this._id,this);
     }
 
-    _dispatch_result(msg,resolve,reject) {
-        switch(msg.type) {
-        case 'result':
-            resolve(msg.value);
-            break;
-        case 'success':
-            resolve();
-            break;
-        case 'resultexception':
-            reject(new ClientError(msg.message));
-            break;
-        case 'error':
-            reject(new InternalJailError(msg.message));
-            break;
-        default:
-            reject(new InternalJailError('unknown result type'));
-            break;
+    async _import(name) {
+        let m = null;
+        try {
+            m = this.importer._modCache.get(name);
+            if(m === undefined) {
+                m = await this.importer.load(msg.name);
+                if(m instanceof ArrayBuffer) m = await WebAssembly.compile(m);
+                else if(!m typeof "string") throw new Error('imported data must be instance of ArrayBuffer or String');
+                this.importer._modCache.set(name,m);
+            }
+        } catch(e) {
+            this._dispatch_module_error(name,e);
+            return;
         }
+        this._dispatch_module(name,m);
+    }
 
-        if(this.autoClose && this._requestQueue.length == 0) this.close();
+    _dispatch_result(msg) {
+        if(msg.type == 'import') this._import(msg.name);
+        else {
+            let [resolve,reject] = jail._requestQueue.shift();
+            switch(msg.type) {
+            case 'result':
+                resolve(msg.value);
+                break;
+            case 'success':
+                resolve();
+                break;
+            case 'resultexception':
+                reject(new ClientError(msg.message));
+                break;
+            case 'error':
+                reject(new InternalJailError(msg.message));
+                break;
+            case 'import':
+                break;
+            default:
+                reject(new InternalJailError('unknown result type'));
+                break;
+            }
+
+            if(this.autoClose && this._requestQueue.length == 0) this.close();
+        }
+    }
+
+    _dispatch_module(name,m) {
+        this._frame.contentWindow.postMessage({
+            type: 'module',
+            name: name,
+            value: m
+        },"*");
+    }
+
+    _dispatch_module_error(name,e) {
+        this._frame.contentWindow.postMessage({
+            type: 'moduleerror',
+            name: name,
+            message: e.message
+        },"*");
     }
 
     _dispatch_request(req,callbacks) {
@@ -138,6 +186,7 @@ class JailContext {
 
 JailContext._idCount = 0;
 JailContext._jails = new Map();
+JailContext._modCache = new Map();
 
 
 window.addEventListener("message",(event) => {
@@ -146,16 +195,15 @@ window.addEventListener("message",(event) => {
     /* this can happen if an iframe was removed before its code finished */
     if(jail === undefined) return;
 
-    const callbacks = jail._requestQueue.shift();
-    jail._dispatch_result(event.data,callbacks[0],callbacks[1]);
+    jail._dispatch_result(event.data);
 },false);
 
 return {
-    JailError: JailError,
-    InternalJailError: InternalJailError,
-    DisconnectJailError: DisconnectJailError,
-    ClosedJailError: ClosedJailError,
-    ClientError: ClientError,
-    JailContext: JailContext};
+    JailError,
+    InternalJailError,
+    DisconnectJailError,
+    ClosedJailError,
+    ClientError,
+    JailContext};
 
 }));
