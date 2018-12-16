@@ -10,11 +10,11 @@ const child_process = require('child_process');
 const CONFIG_LOG_NAME = 'cfg_test_log.txt';
 const OUTPUTNAMEBASE = 'jsjaild';
 const SOURCE_DEST_FOLDER = 'daemon';
-const SOURCE = 'main.cpp';
+const SOURCES = ['main.cpp','almost_json_parser.cpp'];
 const TOOLSETS = ['clang','gcc','msvc','none'];
 
 // v8 builds its own libc++
-const v8_libs = ['v8','v8_libbase','v8_libplatform','icui18n','icuuc','c++']; 
+const v8_libs = ['v8','v8_libbase','v8_libplatform','icui18n','icuuc','c++'];
 const v8_ninja_names = ['v8','v8_libbase','v8_libplatform','icui18n','icuuc','libc++'];
 const v8_libcpp_dirs = [
     path.join('obj','buildtools','third_party','libc++','libc++'),
@@ -391,7 +391,7 @@ function readNinja(config) {
 
             let dest = OUTPUTNAMEBASE;
             if(os.platform == 'win32') dest += '.exe';
-            let src = cenv.relPath(path.join(SOURCE_DEST_FOLDER,SOURCE));
+            let src = SOURCES.map(x => cenv.relPath(path.join(SOURCE_DEST_FOLDER,x))).join(' ');
             let command = `${config.CXX} ${config.NAME_FLAG}${dest} ${config.CPPFLAGS} ${src} ${config.CXXFLAGS} ${config.LDLIBS} ${config.LDFLAGS}`;
             console.log(command);
             await verifyExec(command,{stdio: ['ignore','inherit','inherit']});

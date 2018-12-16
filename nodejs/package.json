@@ -5,6 +5,8 @@
   "main": "index.js",
   "files": [
     "daemon/main.cpp",
+    "daemon/almost_json_parser.hpp",
+    "daemon/almost_json_parser.cpp",
     "scripts/*",
     "test/*"
   ],

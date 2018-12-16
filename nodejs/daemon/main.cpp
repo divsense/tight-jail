@@ -1,17 +1,18 @@
 #include <libplatform/libplatform.h>
 #include <v8.h>
-#include <uv.h>
 #include <memory>
 #include <vector>
 #include <map>
 #include <algorithm>
 #include <utility>
 #include <atomic>
+#include <type_traits>
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
 
 #include "almost_json_parser.hpp"
+#include "uvwrap.hpp"
 
 
 #if V8_MAJOR_VERSION >= 7
@@ -20,12 +21,6 @@
 #else
 #  define STRING_UTF8LENGTH(str,isolate) ((str)->Utf8Length())
 #  define STRING_WRITEUTF8(str,isolate,data) ((str)->WriteUtf8(data))
-#endif
-
-#ifdef NDEBUG
-#  define ASSERT_UV_RESULT(X) (X)
-#else
-#  define ASSERT_UV_RESULT(X) assert((X) == 0)
 #endif
 
 #define RESOLVE_MODULE_FUNC_NAME "__resolveModule"
@@ -113,45 +108,236 @@ function __failModule(name,message) {
 }
 )";
 
-uv_loop_t *main_loop;
-uv_pipe_t server;
-uv_signal_t sig_request;
 
-v8::Isolate::CreateParams create_params;
-v8::Platform *platform;
+struct program;
+program_t *program;
 
-uv_rwlock_t module_cache_lock;
+
 struct js_cache {
     std::string code;
     std::unique_ptr<uint8_t[]> data;
     int length;
 };
+struct waiting_mod_req {
+    unsigned long
+};
+struct uncompiled_buffer {
+    std::unique_ptr<char[]> data;
+    int length;
+
+    /* if "started" is true, then a thread is already compiling the module and
+    other threads will add an entry to "waiting" if they need the same module.
+    */
+    bool started;
+    std::vector<waiting_mod_req> waiting;
+};
 struct cached_module {
-    enum {WASM,JS} tag;
-    union {
+    enum {UNCOMPILED_WASM,UNCOMPILED_JS,WASM,JS} tag;
+    union data_t {
         v8::WasmCompiledModule::TransferrableModule wasm;
         js_cache js;
+        uncompiled_buffer buff;
+
+        data_t() {}
+        ~data_t() {}
     } data;
 
     cached_module(v8::WasmCompiledModule::TransferrableModule &&wasm) : tag{WASM} {
         new(&data.wasm) v8::WasmCompiledModule::TransferrableModule(std::move(wasm));
     }
 
-    cached_module(std::string code,uint8_t *data,int length) : tag{JS} {
+    cached_module(std::string code,const uint8_t *compile_data,int length) : tag{JS} {
         new(&data.js) js_cache({code,std::unique_ptr<uint8_t[]>{new uint8_t[length]},length});
-        memcpy(data.js.data.get(),data,length);
+        memcpy(data.js.data.get(),compile_data,length);
     }
 
-    ~cached_module() {
-        if(tag == WASM) data.wasm.~TransferrableModule();
-        else data.js.~js_cache();
+    cached_module(const char *mod_data,int length,tag t) : tag{t} {
+        assert(t == UNCOMPILED_WASM || t == UNCOMPILED_JS);
+        new(&data.buff) uncompiled_buffer({std::unique_ptr<char[]>{new char[length]},length,false,{}});
+        memcpy(data.buff.data.get(),mod_data,length);
+    }
+
+    cached_module(cached_module &&b) {
+        move_assign(b);
+    }
+
+    ~cached_module() { clear(); }
+
+    cached_module &operator=(cached_module &&b) {
+        clear();
+        move_assign(b);
+    }
+
+private:
+    void clear() {
+        switch(tag) {
+        case WASM:
+            data.wasm.~TransferrableModule();
+            break;
+        case JS:
+            data.js.~js_cache();
+            break;
+        default:
+            assert(tag == UNCOMPILED_WASM || tag == UNCOMPILED_JS);
+            data.buff.~uncompiled_buffer();
+            break;
+        }
+    }
+
+    void move_assign(cached_module &&b) {
+        tag = b.tag;
+        switch(tag) {
+        case WASM:
+            new(&data.wasm) v8::WasmCompiledModule::TransferrableModule(std::move(b.data.wasm));
+            break;
+        case JS:
+            new(&data.js) js_cache(std::move(b.data.js));
+            break;
+        default:
+            assert(tag == UNCOMPILED_WASM || tag == UNCOMPILED_JS);
+            new(&data.buff) uncompiled_buffer(std::move(b.data.buff));
+            break;
+        }
     }
 };
-std::map<std::string,cached_module> module_cache;
+
+struct v8_program_t {
+    v8::Platform *platform;
+
+    v8_program_t(const char *progname) {
+        v8::V8::InitializeICUDefaultLocation(progname);
+        v8::V8::InitializeExternalStartupData(progname);
+        platform = v8::platform::CreateDefaultPlatform();
+        v8::V8::InitializePlatform(platform);
+        v8::V8::Initialize();
+    }
+
+    ~program_t() {
+        v8::V8::Dispose();
+        v8::V8::ShutdownPlatform();
+        delete platform;
+    }
+};
+
+struct command_dispatcher {
+    almost_json_parser::parser command_buffer;
+
+    /* when true, there was a parse error in current request and further input
+    will be ignored until the start of the next request */
+    bool parse_error;
+
+    command_dispatcher() : parse_error{false} {}
+
+    void handle_input(uv_stream_t *output_s,ssize_t read,const uv_buf_t *buf) noexcept;
+    virtual void register_task() = 0;
+    virtual void on_read_error() = 0;
+    virtual void on_alloc_error() {
+        fprintf(stderr,"insufficient memory for command");
+    }
+
+    static int type_str_to_index(int size,std::string *types) {
+        auto type = command_buffer.value.find(request_task::str_type);
+        if(type == command_buffer.value.end() || !type->second.is_string) {
+            queue_response(
+                reinterpret_cast<uv_stream_t*>(&client),
+                copy_string(R"({"type":"error","errtype":"request","message":"invalid request"})"));
+            return -1;
+        }
+
+        for(int i=0; i<size; ++i) {
+            if(types[i] == type->second.data) {
+                return i;
+            }
+        }
+
+        queue_response(
+            reinterpret_cast<uv_stream_t*>(&client),
+            copy_string(R"({"type":"error","errtype":"request","message":"unknown request type"})"));
+        return -1;
+    }
+
+protected:
+    ~command_dispatcher() = default;
+};
+
+void command_dispatcher::handle_input(uv_stream_t *output_s,ssize_t read,const uv_buf_t *buf) noexcept {
+    auto cc = reinterpret_cast<client_connection*>(s->data);
+
+    if(read < 0) {
+        on_read_error();
+    } else if(read > 0) {
+        try {
+            auto start = buf->base;
+            auto end = start + read;
+            auto zero = std::find(start,end,0);
+
+            for(;;) {
+                try {
+                    while(zero != end) {
+                        if(!parse_error) {
+                            cc->command_buffer.feed(start,zero-start);
+                            cc->command_buffer.finish();
+                            cc->register_task();
+                        }
+                        cc->command_buffer.reset();
+                        parse_error = false;
+
+                        start = zero + 1;
+                        zero = std::find(start,end,0);
+                    }
+
+                    if(!parse_error) cc->command_buffer.feed(start,end);
+                    break;
+                } catch(almost_json_parser::syntax_error&) {
+                    parse_error = true;
+                    queue_response(
+                        output_s,
+                        copy_string(R"({"type":"error","errtype":"request","message":"invalid JSON"})"));
+                }
+            }
+        } catch(std::bad_alloc&) {
+            on_alloc_error();
+        }
+    }
+
+    delete[] buf->base;
+}
+
+struct program_t : v8_program_t, command_dispatcher {
+    typedef std::map<std::string,cached_module> module_cache_map;
+
+    uvwrap::mutex_t module_cache_lock;
+    uvwrap::mutex_t module_request_lock;
+    uvwrap::loop_t main_loop;
+    uvwrap::pipe_t server;
+    uvwrap::signal_t sig_request;
+    uvwrap::pipe_t stdin;
+    uvwrap::pipe_t stdout;
+    uvwrap::async_t mod_dispatcher;
+    v8::StartupData snapshot;
+    v8::Isolate::CreateParams create_params;
+    std::vector<std::u16string> module_requests;
+    module_cache_map module_cache;
+
+    program_t(const char *progname);
+    ~program_t();
+
+    void request_module(std::u16string &&name) {
+        uvwrap::mutex_scope_lock lock{module_request_lock};
+        module_requests.push_back(std::move(name));
+    }
+
+    void on_read_error() override {
+        fprintf(stderr,"error in standard-in\n");
+    }
+
+    void register_task() override;
+};
+
+program_t *program;
 
 struct bad_request {};
 struct bad_context {};
-struct uv_exception { int code; };
 
 template<typename T> v8::Local<T> check_r(v8::Local<T> x) {
     if(x.IsEmpty()) throw bad_request{};
@@ -167,47 +353,9 @@ template<typename T> v8::Local<T> check_r(v8::MaybeLocal<T> x) {
 std::string to_std_str(v8::Isolate *isolate,v8::Local<v8::Value> x) {
     v8::String::Utf8Value id{isolate,x};
     if(!*id) throw bad_request{};
-    return std::string{*id,id.length()};
+    return std::string{*id,size_t(id.length())};
 }
 
-class mutex_scope_lock {
-    uv_mutex_t &m;
-
-public:
-    mutex_scope_lock(uv_mutex_t &m) : m(m) {
-        uv_mutex_lock(&m);
-    }
-
-    ~mutex_scope_lock() {
-        uv_mutex_unlock(&m);
-    }
-};
-
-class read_scope_lock {
-    uv_rwlock_t &rw;
-
-public:
-    read_scope_lock(uv_rwlock_t &rw) : rw(rw) {
-        uv_rwlock_rdlock(&rw);
-    }
-
-    ~read_scope_lock() {
-        uv_rwlock_rdunlock(&rw);
-    }
-};
-
-class write_scope_lock {
-    uv_rwlock_t &rw;
-
-public:
-    write_scope_lock(uv_rwlock_t &rw) : rw(rw) {
-        uv_rwlock_wrlock(&rw);
-    }
-
-    ~write_scope_lock() {
-        uv_rwlock_wrunlock(&rw);
-    }
-};
 
 struct list_node {
     list_node *prev, *next;
@@ -251,68 +399,62 @@ const intptr_t external_references[] = {
     reinterpret_cast<intptr_t>(&sendImportMessage),
     0};
 
-struct request_task;
+template<size_t N> char *copy_string(const char (&str)[N]) {
+    char *r = new char[N];
+    memcpy(r,str,N);
+    return r;
+}
+
+
+struct client_task;
 
 struct task_loop {
     v8::Isolate *isolate;
-    uv_loop_t loop;
-    uv_async_t dispatcher;
-    uv_thread_t thread;
     std::shared_ptr<v8::TaskRunner> task_runner;
+    uvwrap::loop_t loop;
+    uvwrap::async_t dispatcher;
+    uv_thread_t thread;
     volatile bool closing = false;
 
-    task_loop(v8::Isolate *isolate) : isolate{isolate}, task_runner{platform->GetForegroundTaskRunner(isolate)} {
+    task_loop(v8::Isolate *isolate) :
+        isolate{isolate},
+        task_runner{platform->GetForegroundTaskRunner(isolate)},
+        dispatcher{
+            loop,
+            [](uv_async_t *handle) {
+                auto tloop = reinterpret_cast<task_loop*>(handle->data);
+                if(tloop->closing) {
+                    tloop->loop.stop();
+                } else {
+                    while(v8::platform::PumpMessageLoop(platform,tloop->isolate))
+                        tloop->isolate->RunMicrotasks();
+                }
+            },
+            this}
+    {
         int r;
-        if((r = uv_loop_init(&loop))) throw uv_exception{r};
-        try {
-            if((r = uv_async_init(
-                &loop,
-                &dispatcher,
-                [](uv_async_t *handle) {
-                    auto tloop = reinterpret_cast<task_loop*>(handle->data);
-                    if(tloop->closing) {
-                        uv_stop(&tloop->loop);
-                    } else {
-                        while(v8::platform::PumpMessageLoop(platform,tloop->isolate))
-                            tloop->isolate->RunMicrotasks();
-                    }
-                })))
-                throw uv_exception{r};
 
-            dispatcher.data = this;
-
-            if((r = uv_thread_create(
-                &thread,
-                [](void *arg) {
-                    uv_run(reinterpret_cast<uv_loop_t*>(arg),UV_RUN_DEFAULT);
-                },
-                &loop)))
-            {
-                uv_close(reinterpret_cast<uv_handle_t*>(&dispatcher),nullptr);
-                throw uv_exception{r};
-            }
-        } catch(...) {
-            uv_run(&loop,UV_RUN_DEFAULT); // needed to free any handles
-            throw;
+        if((r = uv_thread_create(
+            &thread,
+            [](void *arg) {
+                uv_run(reinterpret_cast<uv_loop_t*>(arg),UV_RUN_DEFAULT);
+            },
+            &loop.data)))
+        {
+            throw uv_exception{r};
         }
     }
 
     ~task_loop() {
         closing = true;
-        ASSERT_UV_RESULT(uv_async_send(&dispatcher));
+        ASSERT_UV_RESULT(uv_async_send(&dispatcher.data));
         ASSERT_UV_RESULT(uv_thread_join(&thread));
         closing = false; // don't try to stop the loop again
-
-        uv_close(reinterpret_cast<uv_handle_t*>(&dispatcher),nullptr);
-
-        uv_run(&loop,UV_RUN_DEFAULT); // needed to free any handles
-
-        ASSERT_UV_RESULT(uv_loop_close(&loop));
     }
 
     void add_task(std::unique_ptr<v8::Task> &&task) {
         task_runner->PostTask(std::move(task));
-        ASSERT_UV_RESULT(uv_async_send(&dispatcher));
+        ASSERT_UV_RESULT(uv_async_send(&dispatcher.data));
     }
 };
 
@@ -330,7 +472,7 @@ struct autoclose_isolate {
  * request instances that belong to this, by the time the callback is called,
  * it won't delete itself and instead the last request to be destroyed will
  * delete this. */
-struct client_connection : private list_node, public autoclose_isolate {
+struct client_connection : private list_node, public autoclose_isolate, command_dispatcher {
     typedef std::map<unsigned long,v8::UniquePersistent<v8::Context>> context_map;
 
     static client_connection *conn_head;
@@ -341,9 +483,8 @@ struct client_connection : private list_node, public autoclose_isolate {
     uv_pipe_t client;
 
     task_loop tloop;
-    almost_json_parser::parser command_buffer;
     v8::UniquePersistent<v8::Context> request_context;
-    request_task *requests_head;
+    client_task *requests_head;
     context_map contexts;
     unsigned long next_id;
 
@@ -353,23 +494,11 @@ struct client_connection : private list_node, public autoclose_isolate {
      */
     bool closed;
 
-    /* when true, there was a parse error in current request and further input
-    will be ignored until the start of the next request */
-    bool parse_error;
-
     enum {
-        STR_TYPE=0,
-        STR_FUNC,
-        STR_ARGS,
-        STR_CONTEXT,
-        STR_URI,
-        STR_CODE,
-        STR_CREATE_CONTEXT,
-        STR_DESTROY_CONTEXT,
-        STR_EVAL,
-        STR_EXEC,
-        STR_CALL,
-        STR_GETSTATS,
+        STR_STRING=0,
+        RESOLVE_MODULE,
+        RESOLVE_MODULE_CACHE,
+        EXPORTS,
         COUNT_STR
     };
 
@@ -377,7 +506,7 @@ struct client_connection : private list_node, public autoclose_isolate {
     static const char *str_raw[COUNT_STR];
 
     client_connection() :
-            autoclose_isolate{v8::Isolate::New(create_params)},
+            autoclose_isolate{v8::Isolate::New(program->create_params)},
             tloop{isolate},
             requests_head{nullptr},
             next_id{1},
@@ -411,14 +540,23 @@ struct client_connection : private list_node, public autoclose_isolate {
 
     v8::Local<v8::ObjectTemplate> get_globals();
 
-    v8::Local<v8::String> get_str(unsigned int i);
+    v8::MaybeLocal<v8::String> try_get_str(unsigned int i) noexcept;
+    v8::Local<v8::String> get_str(unsigned int i) { return check_r(try_get_str(i)); }
 
     void close();
 
-    void register_task();
+    void register_task() override;
 
     static void close_all() {
         for(auto itr = conn_head; itr; itr = static_cast<client_connection*>(itr->next)) itr->close();
+    }
+
+    void on_read_error() override {
+        close();
+    }
+    void on_alloc_error() override {
+        command_dispatcher::on_alloc_error();
+        close();
     }
 };
 
@@ -448,30 +586,24 @@ v8::Local<v8::ObjectTemplate> client_connection::get_globals() {
     return globals_template.Get(isolate);
 }
 
-v8::Local<v8::String> client_connection::get_str(unsigned int i) {
+v8::MaybeLocal<v8::String> client_connection::try_get_str(unsigned int i) noexcept {
     assert(i < COUNT_STR);
     if(str[i].IsEmpty()) {
-        str[i].Reset(isolate,check_r(v8::String::NewFromUtf8(
+        v8::Local<String> tmp;
+        if(!v8::String::NewFromUtf8(
             isolate,
             str_raw[i],
-            v8::NewStringType::kNormal)));
+            v8::NewStringType::kNormal).ToLocal(&tmp)) return {};
+        str[i].Reset(isolate,tmp);
     }
     return str[i].Get(isolate);
 }
 
 const char *client_connection::str_raw[client_connection::COUNT_STR] = {
-    "type",
-    "func",
-    "args",
-    "context",
-    "URI",
-    "code",
-    "createcontext",
-    "destroycontext",
-    "eval",
-    "exec",
-    "call",
-    "getstats"
+    "string",
+    RESOLVE_MODULE_FUNC_NAME,
+    RESOLVE_MODULE_CACHE_FUNC_NAME,
+    "exports"
 };
 
 struct write_request {
@@ -483,7 +615,26 @@ struct write_request {
     }
 };
 
-struct request_task : private list_node, public v8::Task {
+struct client_task : private list_node, public v8::Task {
+    friend struct client_connection;
+
+    client_connection *client;
+    bool cancelled;
+
+    virtual ~client_task() {
+        if(client->requests_head == this) client->requests_head = static_cast<client_task*>(next);
+        remove();
+        if(!client->requests_head && client->closed) delete client;
+    }
+
+    void cancel() {
+        cancelled = true;
+    }
+protected:
+    client_task(client_connection *client) : client{client}, cancelled{false} {}
+};
+
+struct request_task : client_task {
     friend struct client_connection;
 
     enum type_t {
@@ -501,30 +652,28 @@ struct request_task : private list_node, public v8::Task {
     static const std::string request_types[COUNT_TYPES];
     static const std::string str_type;
     static const std::string str_code;
+    static const std::string str_func;
+    static const std::string str_args;
+    static const std::string str_context;
+    static const std::string str_name;
+    static const std::string str_id;
 
-    client_connection *client;
     almost_json_parser::value_map values;
-    bool cancelled;
-
-    ~request_task() {
-        if(client->requests_head == this) client->requests_head = static_cast<request_task*>(next);
-        remove();
-        if(!client->requests_head && client->closed) delete client;
-    }
 
     void Run() override;
 
     v8::Local<v8::Value> get_value(const std::string &name,v8::Local<v8::Context> context) const;
 
-    void cancel() {
-        cancelled = true;
-    }
-
 private:
     request_task(client_connection *client,type_t type) :
-        type{type_t},
-        client{client},
-        cancelled(false) {}
+        client_task{client},
+        type{type} {}
+};
+
+struct module_task : client_task {
+    std::string name;
+    std::string mid;
+    void Run() override;
 };
 
 const std::string request_task::request_types[request_task::COUNT_TYPES] = {
@@ -540,69 +689,32 @@ const std::string request_task::request_types[request_task::COUNT_TYPES] = {
 
 const std::string request_task::str_type = "type";
 const std::string request_task::str_code = "code";
+const std::string request_task::str_func = "func";
+const std::string request_task::str_args = "args";
+const std::string request_task::str_context = "context";
+const std::string request_task::str_name = "name";
+const std::string request_task::str_id = "id";
 
 v8::Local<v8::Value> request_task::get_value(const std::string &name,v8::Local<v8::Context> context) const {
+    using namespace v8;
+
     auto itr = values.find(name);
     if(itr == values.end()) {
         client->isolate->ThrowException(
-            v8::Exception::TypeError(
-                v8::String::NewFromUtf8(
-                    isolate,
+            Exception::TypeError(
+                String::NewFromUtf8(
+                    client->isolate,
                     "invalid request",
-                    v8::NewStringType::kNormal).ToLocalChecked()));
+                    NewStringType::kNormal).ToLocalChecked()));
         throw bad_request{};
     }
 
     auto r = check_r(String::NewFromUtf8(
         client->isolate,
-        itr->data.data(),
+        itr->second.data.data(),
         NewStringType::kNormal,
-        itr->data.size()));
-    return itr->is_string ? r : check_r(JSON::Parse(context,r));
-}
-
-void client_connection::register_task() {
-    auto type = command_buffer.value.find(request_task::str_type);
-    if(!type.is_string) {
-        queue_response(
-            reinterpret_cast<uv_stream_t*>(client),
-            copy_string(R"({"type":"error","errtype":"request","message":"invalid request"})"));
-        return;
-    }
-
-    request_task::type_t etype;
-    for(int i=0; i<request_task::COUNT_TYPES; ++i) {
-        if(request_task::request_types[i] == type.data) {
-            etype = static_cast<request_type::type_t>(i);
-            goto found_one;
-        }
-    }
-
-    queue_response(
-        reinterpret_cast<uv_stream_t*>(client),
-        copy_string(R"({"type":"error","errtype":"request","message":"unknown request type"})"));
-    return;
-
-found_one:
-    auto task = new request_task(this,etype);
-    std::swap(task->values,command_buffer.value);
-    if(requests_head) requests_head->insert_before(task);
-    requests_head = task;
-    tloop.add_task(std::unique_ptr<request_task>{task});
-}
-
-void client_connection::close() {
-    if(!closed) {
-        closed = true;
-        isolate->TerminateExecution();
-
-        uv_close(
-            reinterpret_cast<uv_handle_t*>(&client),
-            [](uv_handle_t *h) {
-                auto self = reinterpret_cast<client_connection*>(h->data);
-                delete self;
-            });
-    }
+        itr->second.data.size()));
+    return itr->second.is_string ? static_cast<Local<Value>>(r) : check_r(JSON::Parse(context,r));
 }
 
 void queue_response(uv_stream_t *stream,char *msg,ssize_t len=-1) {
@@ -624,6 +736,37 @@ void queue_response(uv_stream_t *stream,char *msg,ssize_t len=-1) {
         });
 }
 
+std::string &get_str_value(command_dispatcher *cd,const std::string &key) {
+    auto val = cd->command_buffer.value.find(key);
+    if(name == cd->command_buffer.value.end() || !val->second.is_string) throw bad_request{};
+    return val->second.data;
+}
+
+void client_connection::register_task() {
+    int rtype = type_str_to_index(request_task::COUNT_TYPES,request_task::request_types);
+    if(rtype == -1) return;
+
+    auto task = new request_task(this,static_cast<request_task::type_t>(rtype));
+    std::swap(task->values,command_buffer.value);
+    if(requests_head) requests_head->insert_before(task);
+    requests_head = task;
+    tloop.add_task(std::unique_ptr<request_task>{task});
+}
+
+void client_connection::close() {
+    if(!closed) {
+        closed = true;
+        isolate->TerminateExecution();
+
+        uv_close(
+            reinterpret_cast<uv_handle_t*>(&client),
+            [](uv_handle_t *h) {
+                auto self = reinterpret_cast<client_connection*>(h->data);
+                delete self;
+            });
+    }
+}
+
 char hex_digit(int x) {
     assert(x >= 0 && x < 16);
     return "01234567890abcdef"[x];
@@ -631,6 +774,8 @@ char hex_digit(int x) {
 
 class string_builder {
     std::vector<char> buffer;
+
+    void add_escaped_char(char16_t c);
 
 public:
     string_builder(size_t reserve=200) {
@@ -648,6 +793,7 @@ public:
     }
 
     void add_escaped(const v8::String::Value &str);
+    void add_escaped(const std::u16string &str);
 
     void add_string(const char *str,size_t length) {
         buffer.insert(buffer.end(),str,str+length);
@@ -677,24 +823,30 @@ char *string_builder::get_string() const {
 
 void string_builder::add_escaped(const v8::String::Value &str) {
     reserve_more(str.length());
-    for(int i = 0; i < str.length(); i++) {
-        uint16_t c = (*str)[i];
-        if(c <= 0xff) {
-            if(c <= 0x7f && isprint(c)) add_char(static_cast<char>(c));
-            else {
-                add_char('\\');
-                add_char('x');
-                add_char(hex_digit(c >> 4));
-                add_char(hex_digit(c & 0xf));
-            }
-        } else {
+    for(int i = 0; i < str.length(); i++) add_escaped_char((*str)[i]);
+}
+
+void string_builder::add_escaped(const std::u16string &str) {
+    reserve_more(str.size());
+    for(char16_t c : str) add_escaped_char(reinterpret_cast<uint16_t>(c));
+}
+
+void string_builder::add_escaped_char(uint16_t c) {
+    if(c <= 0xff) {
+        if(c <= 0x7f && isprint(c)) add_char(static_cast<char>(c));
+        else {
             add_char('\\');
-            add_char('u');
-            add_char(hex_digit(c >> 12));
-            add_char(hex_digit((c >> 8) & 0xf));
-            add_char(hex_digit((c >> 4) & 0xf));
+            add_char('x');
+            add_char(hex_digit(c >> 4));
             add_char(hex_digit(c & 0xf));
         }
+    } else {
+        add_char('\\');
+        add_char('u');
+        add_char(hex_digit(c >> 12));
+        add_char(hex_digit((c >> 8) & 0xf));
+        add_char(hex_digit((c >> 4) & 0xf));
+        add_char(hex_digit(c & 0xf));
     }
 }
 
@@ -776,12 +928,6 @@ struct response_builder {
     }
 };
 
-template<size_t N> char *copy_string(const char (&str)[N]) {
-    char *r = new char[N];
-    memcpy(r,str,N);
-    return r;
-}
-
 void queue_js_exception(uv_stream_t *stream,v8::TryCatch &tc,v8::Isolate *isolate,v8::Local<v8::Context> context) {
     using namespace v8;
 
@@ -838,17 +984,16 @@ void queue_script_exception(uv_stream_t *stream,v8::TryCatch &tc,v8::Isolate *is
     queue_response(stream,tmp.get_string());
 }
 
-void sendImportMessage(const v8::FunctionCallbackInfo<v8::Value> &args) {
+void sendImportMessage(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
     if(args.Length() < 1) return;
 
     auto isolate = args.GetIsolate();
     v8::HandleScope scope(isolate);
 
-    auto context = isolate->GetCurrentContext();
     auto stream = reinterpret_cast<uv_stream_t*>(
         &reinterpret_cast<client_connection*>(isolate->GetData(0))->client);
 
-    v8::String::Value mname{isolate,args[0]}
+    v8::String::Value mname{isolate,args[0]};
     if(!*mname) return;
 
     string_builder tmp;
@@ -859,27 +1004,137 @@ void sendImportMessage(const v8::FunctionCallbackInfo<v8::Value> &args) {
     queue_response(stream,tmp.get_string());
 }
 
-void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) {
+/* Run a script and return the resulting "exports" object */
+v8::MaybeLocal<Value> execute_as_module(client_connection *cc,v8::Local<v8::Script> script) noexcept {
+    using namespace v8;
+
+    auto context = Context::New(cc->isolate,nullptr,cc->get_globals());
+    Context::Scope cscope{context};
+
+    Local<String> str_exports;
+    bool has;
+    if(
+        !cc->get_str(client_connection::STR_EXPORTS).ToLocal(&str_exports) ||
+        context->Global()->Set(
+            context,
+            str_exports,
+            Object::New(cc->isolate)).IsNothing() ||
+        script->Run(context).IsEmpty() ||
+        !context->Global()->Has(context,str_exports).To(&has)) return {};
+
+    if(has) return context->Global()->Get(context,str_exports);
+    return Object::New(cc->isolate);
+}
+
+void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
     using namespace v8;
 
     auto isolate = args.GetIsolate();
     HandleScope scope(isolate);
 
+    auto cc = reinterpret_cast<client_connection*>(isolate->GetData(0));
     auto context = isolate->GetCurrentContext();
 
     String::Utf8Value id{isolate,args.Data()};
     if(!*id) return;
 
-    read_scope_lock lock{module_cache_lock};
-    auto itr = module_cache.find(std::string{*id,id.length()});
-    if(itr == module_cache.end()) {
-        args.GetReturnValue().SetNull();
-        return;
+    program_t::module_cache_map::iterator itr;
+    {
+        uvwrap::mutex_scope_lock lock{module_cache_lock};
+        itr = module_cache.find(std::string{*id,static_cast<size_t>(id.length())});
+        if(itr == module_cache.end()) {
+            args.GetReturnValue().SetNull();
+            return;
+        }
+
+        if(itr->second.tag == cached_module::UNCOMPILED_WASM ||
+            itr->second.tag == cached_module::UNCOMPILED_JS) {
+            if(itr->second.data.buff.started) {
+                /* another thread is compiling this module, wait for it to
+                finish */
+            }
+
+            itr->second.data.buff.started = true;
+        }
     }
 
-    Local<WasmCompiledModule> r;
-    if(WasmCompiledModule::FromTransferrableModule(isolate,*itr).ToLocal(&r))
-        args.GetReturnValue().Set(r);
+    switch(itr->second.tag) {
+    case cached_module::WASM:
+        {
+            Local<WasmCompiledModule> r;
+            if(WasmCompiledModule::FromTransferrableModule(isolate,itr->second.data.wasm).ToLocal(&r))
+                args.GetReturnValue().Set(r);
+        }
+        break;
+    case cached_module::JS:
+        {
+            assert(itr->second.tag == cached_module::JS);
+            auto &cache = itr->second.data.js_cache;
+
+            Local<String> script_str, str_string;
+            if(!(String::NewFromUtf8(
+                    isolate,
+                    cache.code.data(),
+                    NewStringType::kNormal,
+                    cache.code.size()).ToLocal(&script_str) &&
+                cc->get_str(client_connection::STR_STRING).ToLocal(&str_string))) return;
+
+            ScriptCompiler::CachedData data{cache.data,cache.length};
+            Source source{
+                script_str,
+                ScriptOrigin{str_string},
+                &data};
+            Local<Script> script;
+            Local<Value> r;
+            if(!(
+                ScriptCompiler::Compile(
+                    context,
+                    &source,
+                    ScriptCompiler::kConsumeCodeCache).ToLocal(&script) &&
+                execute_as_module(cc,script).ToLocal(&r))) return;
+            args.GetReturnValue().Set(r);
+        }
+        break;
+    case cached_module::UNCOMPILED_WASM:
+        {
+            auto buf = Local<ArrayBuffer>::Cast(value);
+            auto contents = buf->GetContents();
+            WasmModuleObjectBuilderStreaming builder{client->isolate};
+            auto promise = builder.GetPromise();
+            builder.OnBytesReceived(reinterpret_cast<const uint8_t*>(contents.Data()),contents.ByteLength());
+            builder.Finish();
+        }
+        break;
+    default:
+        assert(itr->second.tag == cached_module::UNCOMPILED_JS);
+        {
+            auto &buff = itr->second.data.buff;
+            Local<String> script_str, str_string;
+            if(!(String::NewFromUtf8(
+                    isolate,
+                    buff.data.get(),
+                    NewStringType::kNormal,
+                    buff.length).ToLocal(&script_str) &&
+                cc->get_str(client_connection::STR_STRING).ToLocal(&str_string))) return;
+
+            Source source{
+                script_str,
+                ScriptOrigin{str_string}};
+            Local<Script> script;
+            if(!ScriptCompiler::Compile(
+                context,
+                &source,
+                ScriptCompiler::kProduceCodeCache).ToLocal(&script)) return;
+            auto cache = source.GetCachedData();
+            {
+                uvwrap::mutex_scope_lock lock{module_cache_lock};
+                *itr = cache ?
+                    cached_module{to_std_str(script_str),cache->data,cache->length} :
+                    cached_module{to_std_str(script_str),nullptr,0};
+            }
+        }
+        break;
+    }
 }
 
 std::pair<unsigned long,v8::Local<v8::Context>> get_context(client_connection *cc,v8::Local<v8::Object> msg) {
@@ -905,7 +1160,7 @@ std::vector<v8::Local<v8::Value>> get_array_items(v8::Local<v8::Array> x) {
 }
 
 // this is for when x is supposed to be one of our JS functions
-v8::Local<v8::Function> to_function(v8::Isolate isolate,v8::Local<Value> x) {
+v8::Local<v8::Function> to_function(v8::Isolate isolate,v8::Local<v8::Value> x) {
     if(!x->IsFunction()) {
         isolate->ThrowException(
             v8::Exception::TypeError(
@@ -936,7 +1191,7 @@ void request_task::Run() {
         client->request_context.Reset(client->isolate,Context::New(client->isolate));
     }
     Local<Context> request_context = client->request_context.Get(client->isolate);
-    Context::Scope req_context_scope(request_context);
+    Context::Scope req_context_scope{request_context};
 
     TryCatch trycatch(client->isolate);
 
@@ -965,8 +1220,8 @@ void request_task::Run() {
             break;
         case EXEC:
             {
-                Local<String> code = check_r(check_r(
-                    msg->Get(request_context,CACHED_STR(CODE)))->ToString(request_context));
+                Local<String> code = check_r(get_value(str_code,request_context)
+                    ->ToString(request_context));
                 auto context = get_context(client,msg);
                 Context::Scope context_scope(context.second);
 
@@ -983,10 +1238,9 @@ void request_task::Run() {
             break;
         case CALL:
             {
-                Local<String> fname = check_r(check_r(
-                    msg->Get(request_context,CACHED_STR(FUNC)))->ToString(request_context));
-                Local<Value> tmp = check_r(
-                    msg->Get(request_context,CACHED_STR(ARGS)));
+                Local<String> fname = check_r(get_value(str_func,request_context)
+                    ->ToString(request_context));
+                Local<Value> tmp = get_value(str_args,request_context);
 
                 if(tmp->IsArray()) {
                     Local<Array> args = Local<Array>::Cast(tmp);
@@ -1043,8 +1297,8 @@ void request_task::Run() {
             break;
         case DESTROY_CONTEXT:
             {
-                int64_t id = check_r(check_r(msg->Get(request_context,CACHED_STR(CONTEXT)))
-                    ->ToInteger(client->request_context.Get(client->isolate)))->Value();
+                int64_t id = check_r(get_value(str_context,request_context)
+                    ->ToInteger(request_context))->Value();
                 if(id < 0) throw bad_context{};
                 auto itr = client->contexts.find(static_cast<unsigned long>(id));
                 if(itr == client->contexts.end()) throw bad_context{};
@@ -1058,9 +1312,9 @@ void request_task::Run() {
         case MODULE:
             {
                 try {
-                    Local<String> mname = check_r(check_r(msg->Get(request_context,CACHED_STR(NAME)))->ToString(request_context));
-                    Local<String> mid = check_r(check_r(msg->Get(request_context,CACHED_STR(NORM_NAME)))->ToString(request_context));
-                    Local<Value> value = check_r(msg->Get(request_context,CACHED_STR(VALUE)));
+                    Local<String> mname = check_r(get_value(str_name,request_context)->ToString(request_context));
+                    Local<String> mid = check_r(get_value(str_id,request_context)->ToString(request_context));
+                    Local<Value> value = get_value(str_value,request_context);
 
                     auto context = get_context(client,msg);
                     Context::Scope context_scope(context.second);
@@ -1113,8 +1367,10 @@ void request_task::Run() {
         case MODULE_CACHED:
             {
                 try {
-                    Local<String> mname = check_r(check_r(msg->Get(request_context,CACHED_STR(NAME)))->ToString(request_context));
-                    Local<String> mid = check_r(check_r(msg->Get(request_context,CACHED_STR(NORM_NAME)))->ToString(request_context));
+                    Local<String> mname = check_r(get_value(str_name,request_context)
+                        ->ToString(request_context));
+                    Local<String> mid = check_r(get_value(str_id,request_context)
+                        ->ToString(request_context));
 
                     auto context = get_context(client,msg);
                     Context::Scope context_scope(context.second);
@@ -1178,91 +1434,97 @@ void request_task::Run() {
 
 #undef CACHED_STR
 
+void module_task::Run() {
+    if(client->closed) return;
+
+    try {
+        Local<String> mname = check_r(get_value(str_name,request_context)
+            ->ToString(request_context));
+        Local<String> mid = check_r(get_value(str_id,request_context)
+            ->ToString(request_context));
+
+        auto context = get_context(client,msg);
+        Context::Scope context_scope(context.second);
+
+        Local<Value> args[] = {
+            mname,
+            mid,
+            check_r(Function::New(context,&getCachedMod,mid))
+        };
+        check_r(to_function(client->isolate,check_r(context.second->Global()->Get(context.second,CACHED_STR(RESOLVE_MODULE_CACHE))))->Call(
+            context.second,
+            context.second->Global(),
+            sizeof(args)/sizeof(Local<Value>),
+            args));
+    } catch(bad_request&) {
+    } catch(...) {
+        fprintf(stderr,"unexpected error type\n");
+    }
+}
+
+void program_t::register_task() {
+    almost_json_parser::value_map values;
+    std::swap(values,command_buffer.value);
+    switch(type) {
+    case MODULE:
+        {
+            auto &name = get_str_value(this,request_task::str_name);
+            auto &mid = get_str_value(this,request_task::str_id);
+            auto &mtype = get_str_value(this,request_task::str_modtype);
+            auto &data = get_str_value(this,request_task::str_value);
+
+            cached_module::tag_t tag;
+            if(mtype == "js") tag = cachd_module::UNCOMPILED_JS;
+            else if(mtype == "wasm") tag = cached_module::UNCOMPILED_WASM;
+            else {
+                queue_response(
+                    stream,
+                    copy_string(R"({"type":"error","errtype":"request","message":"invalid module type"})"));
+                break;
+            }
+            uvwrap::mutex_scope_lock lock{module_cache_lock};
+            module_cache.emplace(mid,data.data(),data.size(),tag);
+        }
+        break;
+    case MODULE_CACHED:
+        {
+        }
+        break;
+    default:
+        assert(type == MODULE_ERROR);
+        {
+        }
+        break;
+    }
+}
+
 void on_new_connection(uv_stream_t *server_,int status) noexcept {
     if(status < 0) {
         fprintf(stderr,"connection error: %s\n",uv_strerror(status));
         return;
     }
 
-    client_connection *cc;
     try {
-        cc = new client_connection;
-    } catch(std::bad_alloc&) {
-        fprintf(stderr,"out of memory\n");
-        return;
-    } catch(uv_exception &e) {
-        fprintf(stderr,"error: %s\n",uv_strerror(e.code));
+        auto cc = new client_connection;
+
+        ASSERT_UV_RESULT(uv_accept(server_,reinterpret_cast<uv_stream_t*>(&cc->client.data)));
+
+        cc->client.read_start(
+            [](uv_stream_t *s,ssize_t read,const uv_buf_t *buf) {
+                auto cc = reinterpret_cast<client_connection*>(s->data);
+                cc->handle_input(s,read,buf);
+            });
+    } catch(std::exception &e) {
+        fprintf(stderr,"error: %s\n",e.what());
         return;
     }
-
-    ASSERT_UV_RESULT(uv_accept(server_,reinterpret_cast<uv_stream_t*>(&cc->client)));
-
-    uv_read_start(
-        reinterpret_cast<uv_stream_t*>(&cc->client),
-        [](uv_handle_t *h,size_t suggest_s,uv_buf_t *buf) {
-            *buf = uv_buf_init(new char[suggest_s],static_cast<unsigned int>(suggest_s));
-        },
-        [](uv_stream_t *s,ssize_t read,const uv_buf_t *buf) {
-            auto cc = reinterpret_cast<client_connection*>(s->data);
-
-            if(read < 0) {
-                cc->close();
-            } else if(read > 0) {
-                try {
-                    auto start = buf->base;
-                    auto end = start + read;
-                    auto zero = std::find(start,end,0);
-
-                    for(;;) {
-                        try {
-                            while(zero != end) {
-                                if(!parse_error) {
-                                    cc->command_buffer.feed(start,zero-start);
-                                    cc->command_buffer.finish();
-                                    cc->register_task();
-                                }
-                                cc->command_buffer.reset();
-                                parse_error = false;
-
-                                start = zero + 1;
-                                zero = std::find(start,end,0);
-                            }
-
-                            if(!parse_error) cc->command_buffer.feed(start,end);
-                            break;
-                        } catch(almost_json_parser::syntax_error&) {
-                            parse_error = true;
-                            queue_response(
-                                stream,
-                                copy_string(R"({"type":"error","errtype":"request","message":"invalid JSON"})"));
-                        }
-                    }
-                } catch(std::bad_alloc&) {
-                    fprintf(stderr,"insufficient memory for command");
-                    cc->close();
-                }
-            }
-
-            delete[] buf->base;
-        });
-}
-
-void close_everything() {
-    uv_close(reinterpret_cast<uv_handle_t*>(&sig_request),nullptr);
-    client_connection::close_all();
-    uv_close(reinterpret_cast<uv_handle_t*>(&server),nullptr);
-    uv_rwlock_destroy(&module_cache_lock);
-
-    /* With everything closed, the loop should stop on its own. When debugging,
-       we force the loop to end and print anything that didn't get closed. */
-#ifndef NDEBUG
-    uv_stop(main_loop);
-#endif
 }
 
 void signal_handler(uv_signal_t*,int) {
     fprintf(stderr,"shutting down\n");
-    close_everything();
+    program->sig_request.stop(std::nothrow);
+    client_connection::close_all();
+    program->main_loop.stop();
 }
 
 v8::StartupData create_snapshot() {
@@ -1293,24 +1555,33 @@ v8::StartupData create_snapshot() {
     return r;
 }
 
-int main(int argc, char* argv[]) {
-    if(argc != 2) {
-        fprintf(stderr,"exactly one argument is required\n");
-        return 1;
-    }
+program_t::program_t(const char *progname) :
+    v8_program_t{progname},
+    server{main_loop},
+    sig_request{main_loop},
+    stdin{main_loop},
+    stdout{main_loop},
+    mod_dispatcher{
+        main_loop,
+        [](uv_async_t *handle) {
+            auto p = reinterpret_cast<program_t*>(handle->data);
+            uvwrap::mutex_scope_lock lock{p->module_request_lock};
+            for(auto &req : module_requests) {
+                string_builder tmp;
+                tmp.add_string(R"({"type":"import","name":")");
+                tmp.add_escaped(req);
+                tmp.add_string("\"}");
 
-    v8::V8::InitializeICUDefaultLocation(argv[0]);
-    v8::V8::InitializeExternalStartupData(argv[0]);
-    platform = v8::platform::CreateDefaultPlatform();
-    v8::V8::InitializePlatform(platform);
-    v8::V8::Initialize();
-
-    int r = 0;
-
-    auto snapshot = create_snapshot();
+                queue_response(p->stdout.data,tmp.get_string());
+            }
+            module_requests.clear();
+        },
+        this
+    },
+    snapshot{create_snapshot()}
+{
     if(!snapshot.data) {
-        fprintf(stderr,"failed to create start-up snapshot\n");
-        goto end;
+        throw std::runtime_error("failed to create start-up snapshot");
     }
 
     create_params.array_buffer_allocator =
@@ -1318,76 +1589,44 @@ int main(int argc, char* argv[]) {
     create_params.snapshot_blob = &snapshot;
     create_params.external_references = external_references;
 
-    main_loop = uv_default_loop();
+    stdin.data.data = this;
+}
 
-    if((r = uv_rwlock_init(&module_cache_lock))) {
-        fprintf(stderr,"failed to initialize mutex: %s\n",uv_err_name(r));
-        r = 2;
-        goto loop_end;
-    }
-
-    if((r = uv_signal_init(main_loop,&sig_request))) {
-        fprintf(stderr,"failed to initialize signal handler: %s\n",uv_err_name(r));
-        uv_rwlock_destroy(&module_cache_lock);
-        r = 2;
-        goto loop_end;
-    }
-
-    if((r = uv_signal_start(&sig_request,&signal_handler,SIGINT))) {
-        fprintf(stderr,"failed to initialize signal handler: %s\n",uv_err_name(r));
-        uv_close(reinterpret_cast<uv_handle_t*>(&sig_request),nullptr);
-        uv_rwlock_destroy(&module_cache_lock);
-        r = 2;
-        goto loop_end;
-    }
-
-    if((r = uv_pipe_init(main_loop,&server,0))) {
-        fprintf(stderr,"filed to initialize socket/pipe: %s\n",uv_err_name(r));
-        uv_close(reinterpret_cast<uv_handle_t*>(&sig_request),nullptr);
-        uv_rwlock_destroy(&module_cache_lock);
-        r = 2;
-        goto loop_end;
-    }
-
-    if((r = uv_pipe_bind(&server,argv[1]))) {
-        fprintf(stderr,"bind error: %s\n",uv_err_name(r));
-        close_everything();
-        r = 1;
-        goto loop_end;
-    }
-    if((r = uv_listen(reinterpret_cast<uv_stream_t*>(&server),128,&on_new_connection))) {
-        fprintf(stderr,"listen error: %s\n",uv_err_name(r));
-        close_everything();
-        r = 2;
-        goto loop_end;
-    }
-
-    /* this is to let a parent process know that a socket/pipe is ready */
-    printf("ready\n");
-    fflush(stdout);
-
-loop_end:
-    /* even if we're shutting down, this still needs to be called to release
-       resources */
-    uv_run(main_loop,UV_RUN_DEFAULT);
-
-#ifndef NDEBUG
-    {
-        int r2 = uv_loop_close(main_loop);
-        if(r2) uv_print_all_handles(main_loop,stderr);
-    }
-#else
-    uv_loop_close(main_loop);
-#endif
-
-end:
-    module_cache.clear();
+program_t::~program_t() {
     delete[] snapshot.data;
-    v8::V8::Dispose();
-    v8::V8::ShutdownPlatform();
     delete create_params.array_buffer_allocator;
-    delete platform;
+}
 
-    return r;
+int main(int argc, char* argv[]) {
+    if(argc != 2) {
+        fprintf(stderr,"exactly one argument is required\n");
+        return 1;
+    }
+
+    try {
+        program_t p{argv[0]};
+        program = &p;
+
+        p.sig_request.start(&signal_handler,SIGINT);
+        p.server.bind(argv[1]);
+        p.server.listen(128,&on_new_connection);
+        p.stdin.open(0);
+        p.stdin.read_start([](uv_stream_t *s,ssize_t read,const uv_buf_t *buf) noexcept {
+            auto p = reinterpret_cast<program_t*>(s->data);
+            p->handle_input(reinterpret_cast<uv_stream_t*>(&p->stdout.data),read,buf);
+        });
+        p.stdout.open(1);
+
+        /* this is to let a parent process know that a socket/pipe is ready */
+        printf("ready\n");
+        fflush(stdout);
+
+        p.main_loop.run(UV_RUN_DEFAULT);
+    } catch(std::exception &e) {
+        fprintf(stderr,"%s\n",e.what());
+        return 2;
+    }
+
+    return 0;
 }
 

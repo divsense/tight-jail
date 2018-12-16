@@ -6,6 +6,10 @@
 
 namespace almost_json_parser {
 
+const char *syntax_error::what() const noexcept override {
+    return "syntax error";
+}
+
 parse_state::~parse_sate() {}
 
 struct parse_toplevel {

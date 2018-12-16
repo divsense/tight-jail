@@ -5,6 +5,8 @@
 #define almost_json_parser_hpp
 
 #include <map>
+#include <vector>
+#include <string>
 
 namespace almost_json_parser {
 
@@ -12,9 +14,7 @@ constexpr int INPUT_BUFFER_SIZE = 16;
 
 class syntax_error : public std::exception {
 public:
-    const char *what() const override {
-        return "syntax error";
-    }
+    const char *what() const noexcept override;
 };
 
 struct parsed_value {
@@ -22,9 +22,11 @@ struct parsed_value {
     bool is_string; // if false, "data" is an unparsed JSON value
 };
 
+class parser;
+
 struct parse_state {
     virtual ~parse_state() = 0;
-    virtual bool parse(almost_json_parser&,const char*&) = 0;
+    virtual bool parse(parser&,const char*&) = 0;
 };
 
 using value_map = std::map<std::string,parsed_value>;
@@ -43,7 +45,7 @@ public:
     void finish();
     void reset();
 
-    void push_state(parse_sate *state);
+    void push_state(parse_state *state);
 };
 
 }
