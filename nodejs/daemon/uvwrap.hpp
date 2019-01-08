@@ -24,6 +24,7 @@
 namespace uvwrap {
     struct uv_error : std::exception {
         int code;
+        uv_error(int code) : code{code} {}
         const char *what() const noexcept override { return uv_strerror(code); }
     };
 
@@ -87,7 +88,7 @@ namespace uvwrap {
         uv_mutex_t &m;
 
     public:
-        mutex_scope_lock(mutex_t &m) : m{m.data} {
+        mutex_scope_lock(mutex_t &mut) : m{mut.data} {
             uv_mutex_lock(&m);
         }
 
@@ -110,7 +111,7 @@ namespace uvwrap {
         uv_rwlock_t &rw;
 
     public:
-        read_scope_lock(rwlock_t &rw) : rw{rw.data} {
+        read_scope_lock(rwlock_t &rwlock) : rw{rwlock.data} {
             uv_rwlock_rdlock(&rw);
         }
 
@@ -123,7 +124,7 @@ namespace uvwrap {
         uv_rwlock_t &rw;
 
     public:
-        write_scope_lock(rwlock_t &rw) : rw{rw.data} {
+        write_scope_lock(rwlock_t &rwlock) : rw{rwlock.data} {
             uv_rwlock_wrlock(&rw);
         }
 
