@@ -7,6 +7,20 @@ function sleep(ms) {
     return new Promise(resolve => { setTimeout(resolve,ms); });
 }
 
+function moduleResolver(mid) {
+    switch(mid) {
+    case 'a':
+        return 'exports.square = x => x * x;';
+    default:
+        return null;
+    }
+}
+
+function moduleNameNormalizer(name) {
+    if(name == 'z') return null;
+    return name.toLowerCase();
+}
+
 function commonTests(C) {
     it('should be able to evaluate JavaScript',async function () {
         var result = await (new C(true)).eval('3 * 6');
@@ -50,7 +64,7 @@ function commonTests(C) {
         assert.equal(result,11);
     });
 
-    it('should be able to execute remote files',async function () {
+    /*it('should be able to execute remote files',async function () {
         var j = new C();
         try {
             await j.execURI('https://divsense.github.io/tight-jail/samples/basic.js');
@@ -58,7 +72,7 @@ function commonTests(C) {
         } finally {
             j.close();
         }
-    });
+    });*/
 }
 
 describe('tight-jail',function () {
@@ -114,6 +128,44 @@ describe('tight-jail',function () {
                 await j.exec('var x = "hello"');
                 var result = await j.eval('x');
                 assert.equal(result,'hello');
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should be able to call async functions',async function () {
+            var j = new jail.JailContext();
+            try {
+                j.exec('async function X(a) { return a*5; }' +
+                    'async function Y(a) { return await X(a+2); }');
+                var result = await j.call('Y',[2],true);
+                assert.equal(result,20);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should be able to import modules',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver);
+            var j = new jail.JailContext();
+            try {
+                j.exec('async function X(a) {' +
+                           'var m = await jimport("a");' +
+                           'return m.square(a); }');
+                var result = await j.call('X',[3],true);
+                assert.equal(result,9);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('importing the same module should return the same instance',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver);
+            var j = new jail.JailContext();
+            try {
+                assert.isOk(await j.eval('jimport("a") === jimport("a")'));
             } finally {
                 j.close();
             }

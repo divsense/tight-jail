@@ -1,6 +1,6 @@
 {
   "name": "tight-jail",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Execute untrusted JavaScript securely",
   "main": "index.js",
   "files": [
@@ -33,7 +33,8 @@
     "byline": "^5.0.0",
     "fs-extra": "^7.0.0",
     "request": "^2.88.0",
-    "request-promise-native": "^1.0.5"
+    "request-promise-native": "^1.0.5",
+    "yallist": "^3.0.3"
   },
   "devDependencies": {
     "chai": "^4.1.2",

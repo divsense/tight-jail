@@ -23,7 +23,8 @@
   "homepage": "https://github.com/divsense/tight-jail#readme",
   "dependencies": {
     "request": "^2.88.0",
-    "request-promise-native": "^1.0.5"
+    "request-promise-native": "^1.0.5",
+    "yallist": "^3.0.3"
   },
   "devDependencies": {
     "chai": "^4.1.2",

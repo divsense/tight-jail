@@ -3,12 +3,15 @@
 #include <memory>
 #include <vector>
 #include <map>
+#include <set>
+#include <list>
 #include <algorithm>
 #include <utility>
 #include <functional>
 #include <atomic>
 #include <type_traits>
 #include <exception>
+#include <limits>
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
@@ -20,9 +23,20 @@
 #if V8_MAJOR_VERSION >= 7
 #  define STRING_UTF8LENGTH(str,isolate) ((str)->Utf8Length(isolate))
 #  define STRING_WRITEUTF8(str,isolate,data) ((str)->WriteUtf8(isolate,data))
+#  define STRING_WRITEONEBYTE(str,isolate,...) ((str)->WriteOneByte(isolate,__VA_ARGS__))
 #else
 #  define STRING_UTF8LENGTH(str,isolate) ((str)->Utf8Length())
 #  define STRING_WRITEUTF8(str,isolate,data) ((str)->WriteUtf8(data))
+#  define STRING_WRITEONEBYTE(str,isolate,...) ((str)->WriteOneByte(__VA_ARGS__))
+#endif
+
+/* This is mostly for errors that would only be caused by the client doing
+something it isn't supposed to, where detailed error messages aren't needed
+unless debugging. */
+#ifdef NDEBUG
+#  define DEBUG_MESSAGE(...)
+#else
+#  define DEBUG_MESSAGE(...) fprintf(stderr,__VA_ARGS__)
 #endif
 
 #define RESOLVE_MODULE_FUNC_NAME "__resolveModule"
@@ -69,9 +83,6 @@ class __PendingMod {
 }
 
 function jimport(m) {
-  if(r instanceof __PendingMod) return r.promise;
-  if(r !== undefined) return Promise.resolve(r);
-
   return new Promise((resolve,reject) => {
     let r = __moduleCacheByName[m];
     if(r === null) reject(new JailImportError('module not found'));
@@ -82,21 +93,19 @@ function jimport(m) {
     }
     else resolve(r);
   });
-
-  return r;
 }
 
 function __resolveModule(name,mid,getCachedGlobal) {
   let pending = __moduleCacheByName[name];
-  let r = __moduleCacheById[normName];
-  if(r isntanceof __PendingMod) {
+  let r = __moduleCacheById[mid];
+  if(r instanceof __PendingMod) {
     if(pending !== r) {
       r.mergeFrom(pending,name);
       __moduleCacheByName[name] = r;
     }
   } else if(r === undefined) {
     try {
-      r = getCachedGlobal();
+      r = getCachedGlobal(name);
     } catch(e) {
       pending.reject(e);
     }
@@ -121,23 +130,42 @@ function __resolveReadyModule(name,mid,mod) {
 }
 
 function __failModule(name,mid,message) {
-  let pending = __moduleCacheByName[name];
   if(!(message instanceof Error)) message = new JailImportError(message);
-  if(mid !== null) delete __moduleCacheById[mid];
+  if(mid) delete __moduleCacheById[mid];
   __moduleCacheByName[name].reject(message,name);
 }
 )";
+
+
+const std::string str_type = "type";
+const std::string str_code = "code";
+const std::string str_func = "func";
+const std::string str_args = "args";
+const std::string str_context = "context";
+const std::string str_connection = "connection";
+const std::string str_name = "name";
+const std::string str_id = "id";
+const std::string str_ids = "ids";
+const std::string str_modtype = "modtype";
+const std::string str_msg = "msg";
+const std::string str_value = "value";
+const std::string str_async = "async";
 
 
 typedef unsigned long long connection_id_t;
 
 struct program_t;
 program_t *program;
-#ifndef NDEBUG
+#ifdef NDEBUG
+#define LEAK_CHECK_ALLOC
+#else
 uv_thread_t _master_thread;
-#endif
+std::atomic<long> _alloc_count{0};
 
-#define ENSURE_MAIN_THREAD assert(uv_thread_equal(&_master_thread,&uv_thread_self()))
+#define LEAK_CHECK_ALLOC \
+static void *operator new(size_t size) { ++_alloc_count; return ::operator new(size); } \
+static void operator delete(void *ptr) { --_alloc_count; ::operator delete(ptr); }
+#endif
 
 
 template<size_t N> char *copy_string(const char (&str)[N]) {
@@ -165,6 +193,9 @@ struct waiting_mod_req {
     std::string name;
     connection_id_t cc_id;
     unsigned long context_id;
+
+    template<typename T> waiting_mod_req(T &&name,connection_id_t cc_id,unsigned long context_id) :
+        name{std::forward<T>(name)}, cc_id{cc_id}, context_id{context_id} {}
 };
 struct uncompiled_buffer {
     std::unique_ptr<char[]> data;
@@ -192,8 +223,8 @@ struct cached_module {
         new(&data.wasm) v8::WasmCompiledModule::TransferrableModule(std::move(wasm));
     }
 
-    cached_module(std::string code,const uint8_t *compile_data,int length) : tag{JS} {
-        new(&data.js) js_cache({code,std::unique_ptr<uint8_t[]>{new uint8_t[length]},length});
+    cached_module(std::string &&code,const uint8_t *compile_data,int length) : tag{JS} {
+        new(&data.js) js_cache({std::move(code),std::unique_ptr<uint8_t[]>{new uint8_t[length]},length});
         memcpy(data.js.data.get(),compile_data,length);
     }
 
@@ -269,7 +300,7 @@ struct v8_program_t {
 };
 
 struct command_dispatcher {
-    almost_json_parser::parser command_buffer;
+    almost_json_parser::object_parser command_buffer;
 
     /* when true, there was a parse error in current request and further input
     will be ignored until the start of the next request */
@@ -283,14 +314,13 @@ struct command_dispatcher {
     virtual void on_alloc_error() {
         fprintf(stderr,"insufficient memory for command");
     }
+    int type_str_to_index(uv_stream_t *output_s,int size,const std::string *types);
 
 protected:
     ~command_dispatcher() = default;
 };
 
 void command_dispatcher::handle_input(uv_stream_t *output_s,ssize_t read,const uv_buf_t *buf) noexcept {
-    auto cd = reinterpret_cast<command_dispatcher*>(output_s->data);
-
     if(read < 0) {
         on_read_error();
     } else if(read > 0) {
@@ -303,18 +333,18 @@ void command_dispatcher::handle_input(uv_stream_t *output_s,ssize_t read,const u
                 try {
                     while(zero != end) {
                         if(!parse_error) {
-                            cd->command_buffer.feed(start,zero-start);
-                            cd->command_buffer.finish();
-                            cd->register_task();
+                            command_buffer.feed(start,zero-start);
+                            command_buffer.finish();
+                            register_task();
                         }
-                        cd->command_buffer.reset();
+                        command_buffer.reset();
                         parse_error = false;
 
                         start = zero + 1;
                         zero = std::find(start,end,0);
                     }
 
-                    if(!parse_error) cd->command_buffer.feed(start,end-start);
+                    if(!parse_error) command_buffer.feed(start,end-start);
                     break;
                 } catch(almost_json_parser::syntax_error&) {
                     parse_error = true;
@@ -331,31 +361,58 @@ void command_dispatcher::handle_input(uv_stream_t *output_s,ssize_t read,const u
     delete[] buf->base;
 }
 
-template<typename T> class locked_ptr {
-    uvwrap::mutex_scope_lock _lock;
-    T *_ptr;
+/* prevents accidentally accessing data without locking a mutex */
+template<typename T> class thread_shared_data {
+    T _data;
 
 public:
-    locked_ptr(uvwrap::mutex_t &mut,T *_ptr) : _lock{mut}, _ptr{_ptr} {}
-    T *get() const { return _ptr; }
-    T *operator->() const { return _ptr; }
-    T &operator*() const { return *_ptr; }
+    template<typename... U> thread_shared_data(U&&... args) : _data{std::forward<U>(args)...} {}
+    thread_shared_data(const thread_shared_data &b) = delete;
+
+    thread_shared_data &operator=(const thread_shared_data &b) = delete;
+
+    T *get(uvwrap::mutex_scope_lock&) { return &_data; }
+    const T *get(uvwrap::mutex_scope_lock&) const { return &_data; }
 };
+
+struct module_cache_item {
+    const std::string id;
+    thread_shared_data<cached_module> mod;
+
+    template<typename T,typename... U> module_cache_item(T &&id,U&&... args) :
+        id{std::forward<T>(id)}, mod{std::forward<U>(args)...} {}
+
+    cached_module *get(uvwrap::mutex_scope_lock &lock) { return mod.get(lock); }
+    const cached_module *get(uvwrap::mutex_scope_lock &lock) const { return mod.get(lock); }
+};
+
+bool operator<(const std::shared_ptr<module_cache_item> &a,const std::shared_ptr<module_cache_item> &b) {
+    return a->id < b->id;
+}
+bool operator<(const std::shared_ptr<module_cache_item> &a,const std::string &b) {
+    return a->id < b;
+}
+bool operator<(const std::string &a,const std::shared_ptr<module_cache_item> &b) {
+    return a < b->id;
+}
 
 struct client_connection;
 
 struct program_t : v8_program_t, command_dispatcher {
     friend struct client_connection;
 
-    typedef std::map<std::string,cached_module> module_cache_map;
+    /* this is technically not a map, but by using the template form of "find",
+    we treat it like one */
+    typedef std::set<std::shared_ptr<module_cache_item>,std::less<>> module_cache_map;
+
     typedef std::map<connection_id_t,client_connection*> connection_map;
 
     uvwrap::mutex_t module_cache_lock;
     uvwrap::loop_t main_loop;
-    uvwrap::pipe_t server;
+    uvwrap::pipe_t_auto server;
     uvwrap::signal_t sig_request;
-    uvwrap::pipe_t stdin;
-    uvwrap::pipe_t stdout;
+    uvwrap::pipe_t_auto stdin;
+    uvwrap::pipe_t_auto stdout;
     v8::StartupData snapshot;
     v8::Isolate::CreateParams create_params;
     module_cache_map module_cache;
@@ -403,6 +460,11 @@ public:
         return itr == connections.end() ? nullptr : itr->second;
     }
 
+    size_t connection_count() {
+        uvwrap::read_scope_lock lock{connections_lock};
+        return connections.size();
+    }
+
     /* if a client connection started compiling one or more modules, but is
     terminated before it could finish, it might not be able to signal to the
     other threads waiting for the module (this can happen if the connection was
@@ -410,25 +472,36 @@ public:
     modules in the cache, that were started by a no longer existing connection.
     */
     void audit_module_cache() noexcept;
+
+    size_t cache_count() {
+        uvwrap::mutex_scope_lock lock{module_cache_lock};
+        return module_cache.size();
+    }
 };
 
-struct bad_request {};
+struct bad_request_js {};
 struct bad_context {};
 
 template<typename T> v8::Local<T> check_r(v8::Local<T> x) {
-    if(x.IsEmpty()) throw bad_request{};
+    if(x.IsEmpty()) throw bad_request_js{};
     return x;
 }
 
 template<typename T> v8::Local<T> check_r(v8::MaybeLocal<T> x) {
     v8::Local<T> r;
-    if(!x.ToLocal(&r)) throw bad_request{};
+    if(!x.ToLocal(&r)) throw bad_request_js{};
+    return r;
+}
+
+template<typename T> v8::Local<T> check_r(v8::Maybe<T> x) {
+    T r;
+    if(!x.To(&r)) throw bad_request_js{};
     return r;
 }
 
 std::string to_std_str(v8::Isolate *isolate,v8::Local<v8::Value> x) {
     v8::String::Utf8Value id{isolate,x};
-    if(!*id) throw bad_request{};
+    if(!*id) throw bad_request_js{};
     return std::string{*id,size_t(id.length())};
 }
 
@@ -440,43 +513,6 @@ v8::Local<v8::String> from_std_str(v8::Isolate *isolate,const std::string &x) {
         x.size()));
 }
 
-
-struct list_node {
-    list_node *prev, *next;
-
-    list_node() : prev(nullptr), next(nullptr) {}
-
-    void remove() {
-        if(prev) prev->next = next;
-        if(next) next->prev = prev;
-        next = prev = nullptr;
-    }
-
-    void insert_before(list_node *node) {
-        assert(!(node->next || node->prev));
-        if(prev) {
-            prev->next = node;
-            node->prev = prev;
-        }
-        node->next = this;
-        prev = node;
-    }
-
-    void insert_after(list_node *node) {
-        assert(!(node->next || node->prev));
-        if(next) {
-            next->prev = node;
-            node->next = next;
-        }
-        node->prev = this;
-        next = node;
-    }
-
-protected:
-    ~list_node() {
-        assert(!(next || prev));
-    }
-};
 
 void sendImportMessage(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept;
 const intptr_t external_references[] = {
@@ -504,8 +540,10 @@ struct task_loop {
                 if(tloop->closing) {
                     tloop->loop.stop();
                 } else {
-                    while(v8::platform::PumpMessageLoop(program->platform,tloop->isolate))
+                    while(v8::platform::PumpMessageLoop(program->platform,tloop->isolate)) {
+                        v8::Locker lock{tloop->isolate};
                         tloop->isolate->RunMicrotasks();
+                    }
                 }
             },
             this}
@@ -548,30 +586,45 @@ protected:
 };
 
 struct client_connection final : public autoclose_isolate, command_dispatcher {
+    LEAK_CHECK_ALLOC
+
     typedef std::map<unsigned long,v8::UniquePersistent<v8::Context>> context_map;
+    typedef std::pair<std::shared_ptr<module_cache_item>,v8::UniquePersistent<v8::External>> cmod_list_data;
+    typedef std::list<cmod_list_data> cmod_list;
+    typedef std::pair<client_connection*,cmod_list::iterator> cmod_list_ref;
 
     static constexpr int CONTEXT_ID_INDEX = 0;
 
-    uv_pipe_t client;
+    uvwrap::pipe_t_manual client;
 
     task_loop tloop;
     v8::UniquePersistent<v8::Context> request_context;
-    client_task *requests_head;
     context_map contexts;
+
+    /* When cached modules need to be passed across JavaScript functions, we
+    can't rely on the javascript functions to actually get called, since the
+    interpreter can be terminated at any time, so weak references are stored
+    here. */
+    cmod_list transient_cmods;
+
     unsigned long next_id;
     connection_id_t connection_id;
+    uint32_t next_async_id;
 
     v8::UniquePersistent<v8::ObjectTemplate> globals_template;
+    v8::UniquePersistent<v8::ObjectTemplate> mod_globals_template;
 
     int compiling;
 
-    bool closed;
+    volatile bool closed;
 
     enum {
         STR_STRING=0,
         RESOLVE_MODULE,
         RESOLVE_READY_MODULE,
         FAIL_MODULE,
+        PROMISE,
+        RESOLVE,
         EXPORTS,
         COUNT_STR
     };
@@ -581,14 +634,13 @@ struct client_connection final : public autoclose_isolate, command_dispatcher {
 
     client_connection() :
             autoclose_isolate{v8::Isolate::New(program->create_params)},
+            client{program->main_loop,this},
             tloop{isolate},
-            requests_head{nullptr},
             next_id{1},
+            next_async_id{0},
             compiling{0},
             closed{false}
     {
-        client.data = this;
-
         isolate->SetData(0,this);
 
         uvwrap::write_scope_lock lock{program->connections_lock};
@@ -597,11 +649,17 @@ struct client_connection final : public autoclose_isolate, command_dispatcher {
     }
 
     ~client_connection() {
-        assert(!requests_head && closed);
+        assert(closed);
 
         /* all the JS references need to be freed before calling
            isolate->Dispose */
         for(auto &item : str) item.Reset();
+        for(auto &item : transient_cmods) {
+            // make sure the weak callback is not called
+            delete item.second.ClearWeak<cmod_list_ref>();
+
+            item.second.Reset();
+        }
         request_context.Reset();
         globals_template.Reset();
         contexts.clear();
@@ -632,14 +690,30 @@ struct client_connection final : public autoclose_isolate, command_dispatcher {
     }
 
     template<typename TaskT,typename ...T> void register_other_task(T&&... x) {
-        tloop.add_task(std::make_shared<TaskT>(std::forward<T>(x)...));
+        tloop.add_task(std::unique_ptr<TaskT>(new TaskT(this,std::forward<T>(x)...)));
     }
 
     static unsigned long get_context_id(v8::Local<v8::Context> c) {
-        return reinterpret_cast<uintptr_t>(c->GetAlignedPointerFromEmbedderData(CONTEXT_ID_INDEX));
+        return reinterpret_cast<uintptr_t>(
+            v8::External::Cast(*c->GetEmbedderData(CONTEXT_ID_INDEX))->Value());
     }
 
-    int type_str_to_index(int size,const std::string *types);
+    v8::Local<v8::External> new_cmod_node(std::shared_ptr<module_cache_item> cmod) {
+        transient_cmods.push_front(cmod_list_data{cmod,v8::UniquePersistent<v8::External>{}});
+        auto &item = transient_cmods.front();
+        auto e = v8::External::New(isolate,&item);
+        item.second.Reset(isolate,e);
+        item.second.SetWeak(
+            new cmod_list_ref(this,transient_cmods.begin()),
+            [](const v8::WeakCallbackInfo<cmod_list_ref> &data) {
+                auto ref = data.GetParameter();
+                ref->first->transient_cmods.erase(ref->second);
+                delete ref;
+            },
+            v8::WeakCallbackType::kParameter);
+
+        return e;
+    }
 };
 
 
@@ -671,7 +745,9 @@ std::pair<unsigned long,v8::Local<v8::Context>> client_connection::new_user_cont
 
     unsigned long id = next_id++;
     auto c = v8::Context::New(isolate,nullptr,get_globals());
-    c->SetAlignedPointerInEmbedderData(CONTEXT_ID_INDEX,reinterpret_cast<void*>(uintptr_t(id)));
+    c->SetEmbedderData(
+        CONTEXT_ID_INDEX,
+        v8::External::New(isolate,reinterpret_cast<void*>(uintptr_t(id))));
     auto itr = contexts.emplace(id,v8::UniquePersistent<v8::Context>{isolate,c}).first;
     if(weak) itr->second.SetWeak(
         new map_ref(this,itr),
@@ -693,6 +769,7 @@ v8::MaybeLocal<v8::String> client_connection::try_get_str(unsigned int i) noexce
             str_raw[i],
             v8::NewStringType::kNormal).ToLocal(&tmp)) return {};
         str[i].Reset(isolate,tmp);
+        return tmp;
     }
     return str[i].Get(isolate);
 }
@@ -700,17 +777,18 @@ v8::MaybeLocal<v8::String> client_connection::try_get_str(unsigned int i) noexce
 const char *client_connection::str_raw[client_connection::COUNT_STR] = {
     "string",
     RESOLVE_MODULE_FUNC_NAME,
-    RESOLVE_READY_MODULE_FUNC_NAME
+    RESOLVE_READY_MODULE_FUNC_NAME,
     FAIL_MODULE_FUNC_NAME,
+    "Promise",
+    "resolve",
     "exports"
 };
 
 void client_connection::close_async() noexcept {
     try {
         program->run_on_master_thread([=] { this->close(); });
-    } catch(...) {
-        fprintf(stderr,"unable to schedule connection to close\n");
-        std::terminate();
+    } catch(std::exception &e) {
+        irrecoverable_failure(e);
     }
 }
 
@@ -723,16 +801,13 @@ struct write_request {
     }
 };
 
-struct client_task : private list_node, public v8::Task {
+struct client_task : public v8::Task {
+    LEAK_CHECK_ALLOC
+
     friend struct client_connection;
 
     client_connection *client;
     bool cancelled;
-
-    virtual ~client_task() {
-        if(client->requests_head == this) client->requests_head = static_cast<client_task*>(next);
-        remove();
-    }
 
     void cancel() {
         cancelled = true;
@@ -755,20 +830,13 @@ struct request_task : client_task {
     } type;
 
     static const std::string request_types[COUNT_TYPES];
-    static const std::string str_type;
-    static const std::string str_code;
-    static const std::string str_func;
-    static const std::string str_args;
-    static const std::string str_context;
-    static const std::string str_connection;
-    static const std::string str_name;
-    static const std::string str_id;
 
     almost_json_parser::value_map values;
 
     void Run() override;
 
     v8::Local<v8::Value> get_value(const std::string &name,v8::Local<v8::Context> context) const;
+    std::pair<unsigned long,v8::Local<v8::Context>> get_context(v8::Local<v8::Context> request_context);
 
 private:
     request_task(client_connection *client,type_t type) :
@@ -776,11 +844,34 @@ private:
         type{type} {}
 };
 
+enum module_req_type_t {
+    MODULE = 0,
+    MODULE_CACHED,
+    MODULE_ERROR,
+    PURGE_CACHE,
+    MODULE_REQ_COUNT_TYPES
+};
+
+const std::string module_request_types[MODULE_REQ_COUNT_TYPES] = {
+    "module",
+    "modulecached",
+    "moduleerror",
+    "purgecache"
+};
+
 struct module_task : client_task {
     std::string name;
-    std::string mid;
     unsigned long context_id;
+    std::shared_ptr<module_cache_item> cmod;
+
     void Run() override;
+
+    template<typename T>
+    module_task(client_connection *cc,T &&name,unsigned long context_id,const std::shared_ptr<module_cache_item> &cmod) :
+        client_task{cc},
+        name{std::forward<T>(name)},
+        context_id{context_id},
+        cmod{cmod} {}
 };
 
 struct module_error_task : client_task {
@@ -789,6 +880,14 @@ struct module_error_task : client_task {
     std::string msg;
     unsigned long context_id;
     void Run() override;
+
+    template<typename T1,typename T2,typename T3>
+    module_error_task(client_connection *cc,T1 &&name,T2 &&mid,T3 &&msg,unsigned long context_id) :
+        client_task{cc},
+        name{std::forward<T1>(name)},
+        mid{std::forward<T2>(mid)},
+        msg{std::forward<T3>(msg)},
+        context_id{context_id} {}
 };
 
 const std::string request_task::request_types[request_task::COUNT_TYPES] = {
@@ -800,35 +899,33 @@ const std::string request_task::request_types[request_task::COUNT_TYPES] = {
     "getstats"
 };
 
-const std::string request_task::str_type = "type";
-const std::string request_task::str_code = "code";
-const std::string request_task::str_func = "func";
-const std::string request_task::str_args = "args";
-const std::string request_task::str_context = "context";
-const std::string request_task::str_connection = "connection";
-const std::string request_task::str_name = "name";
-const std::string request_task::str_id = "id";
+v8::Local<v8::Value> to_value(
+    v8::Isolate *isolate,
+    v8::Local<v8::Context> context,
+    const almost_json_parser::parsed_value &val)
+{
+    auto r = check_r(v8::String::NewFromUtf8(
+        isolate,
+        val.data.data(),
+        v8::NewStringType::kNormal,
+        val.data.size()));
+    return val.is_string ? static_cast<v8::Local<v8::Value>>(r) : check_r(v8::JSON::Parse(context,r));
+}
 
 v8::Local<v8::Value> request_task::get_value(const std::string &name,v8::Local<v8::Context> context) const {
-    using namespace v8;
-
     auto itr = values.find(name);
     if(itr == values.end()) {
+        DEBUG_MESSAGE("missing attribute \"%s\"\n",name.c_str());
         client->isolate->ThrowException(
-            Exception::TypeError(
-                String::NewFromUtf8(
+            v8::Exception::TypeError(
+                v8::String::NewFromUtf8(
                     client->isolate,
                     "invalid request",
-                    NewStringType::kNormal).ToLocalChecked()));
-        throw bad_request{};
+                    v8::NewStringType::kNormal).ToLocalChecked()));
+        throw bad_request_js{};
     }
 
-    auto r = check_r(String::NewFromUtf8(
-        client->isolate,
-        itr->second.data.data(),
-        NewStringType::kNormal,
-        itr->second.data.size()));
-    return itr->second.is_string ? static_cast<Local<Value>>(r) : check_r(JSON::Parse(context,r));
+    return to_value(client->isolate,context,itr->second);
 }
 
 void queue_response(uv_stream_t *stream,char *msg,ssize_t len) {
@@ -852,30 +949,28 @@ void queue_response(uv_stream_t *stream,char *msg,ssize_t len) {
 
 void queue_response(uvwrap::pipe_t &stream,char *msg,ssize_t len=-1) {
     queue_response(
-        reinterpret_cast<uv_stream_t*>(&stream.data),
+        stream.as_uv_stream(),
         msg,
         len);
 }
 
-std::string &get_str_value(command_dispatcher *cd,const std::string &key) {
-    auto val = cd->command_buffer.value.find(key);
-    if(val == cd->command_buffer.value.end() || !val->second.is_string) throw bad_request{};
-    return val->second.data;
-}
-
 void client_connection::register_task() {
-    int rtype = type_str_to_index(request_task::COUNT_TYPES,request_task::request_types);
+    int rtype = type_str_to_index(
+        client.as_uv_stream(),
+        request_task::COUNT_TYPES,
+        request_task::request_types);
     if(rtype == -1) return;
 
     auto task = std::unique_ptr<request_task>(new request_task(this,static_cast<request_task::type_t>(rtype)));
     std::swap(task->values,command_buffer.value);
-    if(requests_head) requests_head->insert_before(task.get());
-    requests_head = task.get();
     tloop.add_task(std::move(task));
 }
 
 void client_connection::close() {
-    ENSURE_MAIN_THREAD;
+#ifndef NDEBUG
+    auto _tmp = uv_thread_self();
+    assert(uv_thread_equal(&_master_thread,&_tmp));
+#endif
 
     if(!closed) {
         closed = true;
@@ -886,8 +981,7 @@ void client_connection::close() {
         isolate->TerminateExecution();
         if(compiling) program->audit_module_cache();
 
-        uv_close(
-            reinterpret_cast<uv_handle_t*>(&client),
+        client.close(
             [](uv_handle_t *h) {
                 auto self = reinterpret_cast<client_connection*>(h->data);
                 delete self;
@@ -895,11 +989,15 @@ void client_connection::close() {
     }
 }
 
-int client_connection::type_str_to_index(int size,const std::string *types) {
-    auto type = command_buffer.value.find(request_task::str_type);
+int command_dispatcher::type_str_to_index(uv_stream_t *output_s,int size,const std::string *types) {
+    auto type = command_buffer.value.find(str_type);
     if(type == command_buffer.value.end() || !type->second.is_string) {
+        DEBUG_MESSAGE(
+            type == command_buffer.value.end() ?
+            "missing attribute \"type\"\n" :
+            "\"type\" is not a string\n");
         queue_response(
-            reinterpret_cast<uv_stream_t*>(&client),
+            output_s,
             copy_string(R"({"type":"error","errtype":"request","message":"invalid request"})"));
         return -1;
     }
@@ -911,7 +1009,7 @@ int client_connection::type_str_to_index(int size,const std::string *types) {
     }
 
     queue_response(
-        reinterpret_cast<uv_stream_t*>(&client),
+        output_s,
         copy_string(R"({"type":"error","errtype":"request","message":"unknown request type"})"));
     return -1;
 }
@@ -924,7 +1022,8 @@ char hex_digit(int x) {
 class string_builder {
     std::vector<char> buffer;
 
-    void add_escaped_char(char16_t c);
+    void add_escaped_char(uint16_t c);
+    void add_escaped_char(uint8_t c);
     template<typename T> void add_integer_s(T i);
     template<typename T> void add_integer_u(T i);
 
@@ -945,6 +1044,7 @@ public:
 
     void add_escaped(const v8::String::Value &str);
     void add_escaped(const std::u16string &str);
+    void add_escaped_ascii(const char *str);
 
     void add_string(const char *str,size_t length) {
         buffer.insert(buffer.end(),str,str+length);
@@ -984,18 +1084,26 @@ void string_builder::add_escaped(const v8::String::Value &str) {
 
 void string_builder::add_escaped(const std::u16string &str) {
     reserve_more(str.size());
-    for(char16_t c : str) add_escaped_char(c);
+    for(char16_t c : str) add_escaped_char(uint16_t(c));
 }
 
-void string_builder::add_escaped_char(char16_t c) {
+void string_builder::add_escaped_ascii(const char *str) {
+    while(*str) add_escaped_char(uint8_t(*str++));
+}
+
+void string_builder::add_escaped_char(uint8_t c) {
+    if(c <= 0x7f && isprint(c)) add_char(c);
+    else {
+        add_char('\\');
+        add_char('x');
+        add_char(hex_digit(c >> 4));
+        add_char(hex_digit(c & 0xf));
+    }
+}
+
+void string_builder::add_escaped_char(uint16_t c) {
     if(c <= 0xff) {
-        if(c <= 0x7f && isprint(c)) add_char(static_cast<char>(c));
-        else {
-            add_char('\\');
-            add_char('x');
-            add_char(hex_digit(c >> 4));
-            add_char(hex_digit(c & 0xf));
-        }
+        add_escaped_char(static_cast<uint8_t>(c));
     } else {
         add_char('\\');
         add_char('u');
@@ -1045,10 +1153,18 @@ template<typename T> void string_builder::add_integer_u(T i) {
     std::reverse(start,buffer.end());
 }
 
-struct escaped {
-    v8::String::Value &val;
-    escaped(v8::String::Value &val) : val(val) {}
+template<typename T> struct _escaped {
+    T &val;
+    explicit _escaped(T &val) : val(val) {}
 };
+
+_escaped<v8::String::Value> escaped(v8::String::Value &val) {
+    return _escaped<v8::String::Value>{val};
+}
+
+_escaped<const std::u16string> escaped(const std::u16string &val) {
+    return _escaped<const std::u16string>{val};
+}
 
 struct response_builder {
     string_builder build;
@@ -1062,7 +1178,7 @@ struct response_builder {
         queue_response(stream,build.get_string());
     }
 
-    void send(uvwrap::pipe_t &stream) { send(reinterpret_cast<uv_stream_t*>(&stream.data)); }
+    void send(uvwrap::pipe_t &stream) { send(stream.as_uv_stream()); }
 
     void add_name(const char *str,size_t length) {
         build.add_char(build.size() ? ',' : '{');
@@ -1092,7 +1208,7 @@ struct response_builder {
         return *this;
     }
 
-    template<size_t N> response_builder &operator()(const char (&name)[N],escaped value) {
+    template<size_t N,typename T> response_builder &operator()(const char (&name)[N],_escaped<T> value) {
         add_name(name,N-1);
         build.add_char(':');
         build.add_char('"');
@@ -1120,43 +1236,62 @@ void queue_js_exception(uv_stream_t *stream,v8::TryCatch &tc,v8::Isolate *isolat
     queue_response(stream,msg);
 }
 
-void queue_script_exception(uv_stream_t *stream,v8::TryCatch &tc,v8::Isolate *isolate,v8::Local<v8::Context> context) {
+void queue_script_exception(uv_stream_t *stream,v8::Local<v8::Value> exc,v8::Local<v8::Message> exc_msg,v8::Isolate *isolate,v8::Local<v8::Context> context,v8::Maybe<uint32_t> async_id=v8::Nothing<uint32_t>()) {
     using namespace v8;
 
-    string_builder tmp;
-    tmp.add_string(R"({"type":"resultexception","message":)");
+    response_builder rb{nullptr};
+    if(async_id.IsJust()) {
+        rb("type","\"asyncresultexception\"");
+        rb("id",async_id.FromJust());
+    } else {
+        rb("type","\"resultexception\"");
+    }
 
-    String::Value exc_str{isolate,tc.Exception()};
+    TryCatch tc{isolate};
+    String::Value exc_str{isolate,exc};
 
     if(*exc_str) {
-        tmp.add_char('"');
-        tmp.add_escaped(exc_str);
-        tmp.add_char('"');
+        rb("message",escaped(exc_str));
 
-        Local<Message> exc_msg = tc.Message();
         if(!exc_msg.IsEmpty()) {
-            tmp.add_string(",\"filename\":");
             String::Value filename{isolate,exc_msg->GetScriptResourceName()};
-            if(*filename) {
-                tmp.add_char('"');
-                tmp.add_escaped(filename);
-                tmp.add_char('"');
-            }
+            if(*filename) rb("filename",escaped(filename));
+            else rb("filename","null");
 
-            tmp.add_string(",\"lineno\":");
             Maybe<int> lineno = exc_msg->GetLineNumber(context);
-            if(lineno.IsJust()) tmp.add_integer(lineno.FromJust());
+            if(lineno.IsJust()) rb("lineno",lineno.FromJust());
+            else rb("lineno","null");
         } else {
-            tmp.add_string(R"(",filename":null,"lineno":null)");
+            rb("filename","null");
+            rb("lineno","null");
         }
     } else {
-        tmp.add_string(R"(null,"filename":null,"lineno":null)");
+        tc.Reset();
+        rb("message","\"<failed to convert exception to string>\"");
+        rb("filename","null");
+        rb("lineno","null");
     }
-    tmp.add_char('}');
 
+    rb.send(stream);
+}
+
+void queue_script_exception(uv_stream_t *stream,v8::TryCatch &tc,v8::Isolate *isolate,v8::Local<v8::Context> context,v8::Maybe<uint32_t> async_id=v8::Nothing<uint32_t>()) {
+    queue_script_exception(stream,tc.Exception(),tc.Message(),isolate,context,async_id);
     tc.Reset();
+}
 
-    queue_response(stream,tmp.get_string());
+void queue_script_exception(uv_stream_t *stream,v8::Local<v8::Value> exc,v8::Isolate *isolate,v8::Local<v8::Context> context,v8::Maybe<uint32_t> async_id=v8::Nothing<uint32_t>()) {
+    queue_script_exception(
+        stream,
+        exc,
+
+        /* there should to be a way to get a native exception from an instance
+        of Value but I don't see one */
+        v8::Local<v8::Message>{},
+
+        isolate,
+        context,
+        async_id);
 }
 
 void c_to_js_exception(v8::Isolate *isolate,std::exception &e) {
@@ -1187,9 +1322,9 @@ void sendImportMessage(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept
         auto con_id = client_connection::get_context_id(context);
 
         program->run_on_master_thread([=] {
-            response_builder rb(nullptr);
-            rb("type","import");
-            rb("name",req);
+            response_builder rb{nullptr};
+            rb("type","\"import\"");
+            rb("name",escaped(req));
             rb("context",con_id);
             rb("connection",cc_id);
             rb.send(program->stdout);
@@ -1198,26 +1333,27 @@ void sendImportMessage(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept
 }
 
 /* Run a script and return the resulting "exports" object */
-v8::MaybeLocal<v8::Value> execute_as_module(client_connection *cc,v8::Local<v8::Script> script) noexcept {
-    using namespace v8;
+struct execute_as_module {
+    v8::Local<v8::Context> context;
+    v8::Context::Scope cscope;
+    v8::Local<v8::String> str_exports;
 
-    auto context = cc->new_user_context(true).second;
-    Context::Scope cscope{context};
+    execute_as_module(client_connection *cc)
+        : context{cc->new_user_context(true).second}, cscope{context}
+    {
+        if(!cc->try_get_str(client_connection::EXPORTS).ToLocal(&str_exports) ||
+            context->Global()->Set(context,str_exports,v8::Object::New(cc->isolate)).IsNothing()) throw bad_request_js{};
+    }
 
-    Local<String> str_exports;
-    bool has;
-    if(
-        !cc->try_get_str(client_connection::EXPORTS).ToLocal(&str_exports) ||
-        context->Global()->Set(
-            context,
-            str_exports,
-            Object::New(cc->isolate)).IsNothing() ||
-        script->Run(context).IsEmpty() ||
-        !context->Global()->Has(context,str_exports).To(&has)) return {};
+    v8::Local<v8::Value> operator()(client_connection *cc,v8::Local<v8::Script> script) {
+        bool has;
+        if(script->Run(context).IsEmpty() ||
+            !context->Global()->Has(context,str_exports).To(&has)) throw bad_request_js {};
 
-    if(has) return context->Global()->Get(context,str_exports);
-    return Object::New(cc->isolate);
-}
+        if(has) return check_r(context->Global()->Get(context,str_exports));
+        return v8::Object::New(cc->isolate);
+    }
+};
 
 // this is for when x is supposed to be one of our JS functions
 v8::MaybeLocal<v8::Function> to_function(v8::Isolate *isolate,v8::Local<v8::Value> x) {
@@ -1287,10 +1423,6 @@ end:
     return true;
 }
 
-struct wasm_compile_data {
-    std::shared_ptr<std::string> name;
-    program_t::module_cache_map::iterator itr;
-};
 void wasm_compile_success(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
     using namespace v8;
 
@@ -1311,34 +1443,21 @@ void wasm_compile_success(const v8::FunctionCallbackInfo<v8::Value> &args) noexc
     }
 
     auto mod = Local<WasmCompiledModule>::Cast(args[0]);
-    cached_module cache(mod->GetTransferrableModule());
+    cached_module cache{mod->GetTransferrableModule()};
 
     Local<Object> vals;
     Local<Value> name;
-    Local<Value> mid;
+    Local<Value> e_node;
     if(!(args.Data()->ToObject(context).ToLocal(&vals) &&
         vals->Get(context,0).ToLocal(&name) &&
-        vals->Get(context,1).ToLocal(&mid))) return;
+        vals->Get(context,1).ToLocal(&e_node))) return;
 
-    String::Utf8Value tmp{isolate,mid};
-    if(!*tmp) return;
+    auto node = reinterpret_cast<client_connection::cmod_list_data*>(Local<External>::Cast(e_node)->Value());
 
     try {
-        std::string std_id{*tmp,static_cast<size_t>(tmp.length())};
-
         {
             uvwrap::mutex_scope_lock lock{program->module_cache_lock};
-            auto itr = program->module_cache.find(std_id);
-            if(itr == program->module_cache.end()) {
-                isolate->ThrowException(
-                    Exception::Error(
-                        String::NewFromUtf8(
-                            isolate,
-                            "missing module data",
-                            NewStringType::kNormal).ToLocalChecked()));
-                return;
-            }
-            std::swap(itr->second,cache);
+            std::swap(*node->first->get(lock),cache);
         }
 
         assert(cache.tag == cached_module::UNCOMPILED_WASM);
@@ -1346,7 +1465,7 @@ void wasm_compile_success(const v8::FunctionCallbackInfo<v8::Value> &args) noexc
             try {
                 for(auto &w : cache.data.buff.waiting) {
                     auto w_cc = program->get_connection(w.cc_id);
-                    if(w_cc) w_cc->register_other_task<module_task>(w.name,std_id,w.context_id);
+                    if(w_cc) w_cc->register_other_task<module_task>(w.name,w.context_id,node->first);
                 }
             } catch(std::exception &e) {
                 /* The waiting list was already swapped. At least one thread is
@@ -1355,10 +1474,16 @@ void wasm_compile_success(const v8::FunctionCallbackInfo<v8::Value> &args) noexc
             }
         }
 
+        Local<String> js_mid;
+        if(!v8::String::NewFromUtf8(
+            isolate,
+            node->first->id.data(),
+            v8::NewStringType::kNormal,
+            node->first->id.size()).ToLocal(&js_mid)) return;
         Local<String> func_name;
         Local<Value> func_val;
         Local<Function> func;
-        Local<Value> args[] = {name,mid,mod};
+        Local<Value> args[] = {name,js_mid,mod};
         if(!(cc->try_get_str(client_connection::RESOLVE_READY_MODULE).ToLocal(&func_name) &&
             context->Global()->Get(context,func_name).ToLocal(&func_val) &&
             to_function(isolate,func_val).ToLocal(&func)) ||
@@ -1390,38 +1515,26 @@ void wasm_compile_fail(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept
 
     Local<Object> vals;
     Local<Value> name;
-    Local<Value> mid;
+    Local<Value> e_node;
     if(!(args.Data()->ToObject(context).ToLocal(&vals) &&
         vals->Get(context,0).ToLocal(&name) &&
-        vals->Get(context,1).ToLocal(&mid))) return;
+        vals->Get(context,1).ToLocal(&e_node))) return;
 
-    String::Utf8Value mid_tmp{isolate,mid};
-    if(!*mid_tmp) return;
+    auto node = reinterpret_cast<client_connection::cmod_list_data*>(Local<External>::Cast(e_node)->Value());
 
     String::Utf8Value msg_tmp{isolate,args[0]};
     if(!*msg_tmp) return;
 
+    std::vector<waiting_mod_req> waiting;
+    auto &mid = node->first->id;
+
     try {
-        std::string std_id{*mid_tmp,static_cast<size_t>(mid_tmp.length())};
-
-        std::vector<waiting_mod_req> waiting;
-
         {
             uvwrap::mutex_scope_lock lock{program->module_cache_lock};
-            auto itr = program->module_cache.find(std_id);
-            if(itr == program->module_cache.end()) {
-                isolate->ThrowException(
-                    Exception::Error(
-                        String::NewFromUtf8(
-                            isolate,
-                            "missing module data",
-                            NewStringType::kNormal).ToLocalChecked()));
-                return;
-            }
-
-            assert(cache.tag == cached_module::UNCOMPILED_WASM);
-            itr->second.data.buff.started = 0;
-            std::swap(itr->second.data.buff.waiting,waiting);
+            auto cmod = node->first->get(lock);
+            assert(cmod->tag == cached_module::UNCOMPILED_WASM);
+            cmod->data.buff.started = 0;
+            std::swap(cmod->data.buff.waiting,waiting);
         }
         --cc->compiling;
 
@@ -1431,7 +1544,7 @@ void wasm_compile_fail(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept
 
                 for(auto &w : waiting) {
                     auto w_cc = program->get_connection(w.cc_id);
-                    if(w_cc) w_cc->register_other_task<module_error_task>(w.name,std_id,std_msg,w.context_id);
+                    if(w_cc) w_cc->register_other_task<module_error_task>(w.name,mid,std_msg,w.context_id);
                 }
             } catch(std::exception &e) {
                 /* The waiting list was already swapped. At least one thread is
@@ -1440,10 +1553,16 @@ void wasm_compile_fail(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept
             }
         }
 
+        Local<String> js_mid;
+        if(!v8::String::NewFromUtf8(
+            isolate,
+            mid.data(),
+            v8::NewStringType::kNormal,
+            mid.size()).ToLocal(&js_mid)) return;
         Local<String> func_name;
         Local<Value> func_val;
         Local<Function> func;
-        Local<Value> args[] = {name,mid,args[0]};
+        Local<Value> args[] = {name,js_mid,args[0]};
         if(!(cc->try_get_str(client_connection::FAIL_MODULE).ToLocal(&func_name) &&
             context->Global()->Get(context,func_name).ToLocal(&func_val) &&
             to_function(isolate,func_val).ToLocal(&func)) ||
@@ -1466,35 +1585,30 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
 
     auto cc = reinterpret_cast<client_connection*>(isolate->GetData(0));
     auto context = isolate->GetCurrentContext();
+    TryCatch trycatch(isolate);
 
-    String::Utf8Value id{isolate,args.Data()};
-    if(!*id) return;
-    v8::String::Utf8Value name{isolate,args[0]};
+    auto node = reinterpret_cast<client_connection::cmod_list_data*>(Local<External>::Cast(args.Data())->Value());
+    String::Utf8Value name{isolate,args[0]};
     if(!*name) return;
 
     try {
-        std::string std_id{*id,static_cast<size_t>(id.length())};
-
-        program_t::module_cache_map::iterator itr;
+        /* It is safe to access the contents without holding
+        program->module_cache_lock if and only if one of the following are true:
+        "tag" is not UNCOMPILED_JS or UNCOMPILED_WASM; or "data.buff.started"
+        was false. Otherwise the contents could be altered from another thread,
+        and in the latter case, "data.buff.started" and "data.buff.waiting" are
+        still not safe to access. */
+        cached_module *cmod;
         {
             uvwrap::mutex_scope_lock lock{program->module_cache_lock};
-            itr = program->module_cache.find(std_id);
-            if(itr == program->module_cache.end()) {
-                isolate->ThrowException(
-                    Exception::Error(
-                        String::NewFromUtf8(
-                            isolate,
-                            "missing module data",
-                            NewStringType::kNormal).ToLocalChecked()));
-                return;
-            }
+            cmod = node->first->get(lock);
 
-            if(itr->second.tag == cached_module::UNCOMPILED_WASM ||
-                itr->second.tag == cached_module::UNCOMPILED_JS) {
-                if(itr->second.data.buff.started) {
+            if(cmod->tag == cached_module::UNCOMPILED_WASM ||
+                cmod->tag == cached_module::UNCOMPILED_JS) {
+                if(cmod->data.buff.started) {
                     /* another thread is compiling this module, wait for it to
                     finish */
-                    itr->second.data.buff.waiting.emplace_back(
+                    cmod->data.buff.waiting.emplace_back(
                         std::string{*name,size_t(name.length())},
                         cc->connection_id,
                         client_connection::get_context_id(context));
@@ -1503,22 +1617,24 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                     return;
                 }
 
-                itr->second.data.buff.started = cc->connection_id;
+                cmod->data.buff.started = cc->connection_id;
                 ++cc->compiling;
             }
         }
 
-        switch(itr->second.tag) {
+        switch(cmod->tag) {
         case cached_module::WASM:
             {
                 Local<WasmCompiledModule> r;
-                if(WasmCompiledModule::FromTransferrableModule(isolate,itr->second.data.wasm).ToLocal(&r))
+                if(WasmCompiledModule::FromTransferrableModule(isolate,cmod->data.wasm).ToLocal(&r)) {
                     args.GetReturnValue().Set(r);
+                    return;
+                }
             }
             break;
         case cached_module::JS:
             {
-                auto &cache = itr->second.data.js;
+                auto &cache = cmod->data.js;
 
                 Local<String> script_str, str_string;
                 if(!(String::NewFromUtf8(
@@ -1526,27 +1642,29 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                         cache.code.data(),
                         NewStringType::kNormal,
                         cache.code.size()).ToLocal(&script_str) &&
-                    cc->try_get_str(client_connection::STR_STRING).ToLocal(&str_string))) return;
+                    cc->try_get_str(client_connection::STR_STRING).ToLocal(&str_string))) break;
 
                 ScriptCompiler::CachedData data{cache.data.get(),cache.length};
                 ScriptCompiler::Source source{
                     script_str,
                     ScriptOrigin{str_string},
                     &data};
-                Local<Script> script;
-                Local<Value> r;
-                if(!(
-                    ScriptCompiler::Compile(
-                        context,
+
+                try {
+                    execute_as_module exec{cc};
+                    args.GetReturnValue().Set(exec(cc,check_r(ScriptCompiler::Compile(
+                        exec.context,
                         &source,
-                        ScriptCompiler::kConsumeCodeCache).ToLocal(&script) &&
-                    execute_as_module(cc,script).ToLocal(&r))) return;
-                args.GetReturnValue().Set(r);
+                        ScriptCompiler::kConsumeCodeCache))));
+                } catch(bad_request_js&) {
+                    break;
+                }
+
+                return;
             }
-            break;
         case cached_module::UNCOMPILED_WASM:
             {
-                auto &buff = itr->second.data.buff;
+                auto &buff = cmod->data.buff;
                 WasmModuleObjectBuilderStreaming builder{isolate};
 
                 {
@@ -1560,7 +1678,7 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                         !(Function::New(context,&wasm_compile_success,vals).ToLocal(&tmp_fthen) &&
                         Function::New(context,&wasm_compile_fail,vals).ToLocal(&tmp_fcatch) &&
                         promise->Then(context,tmp_fthen).ToLocal(&tmp_p)) ||
-                        tmp_p->Catch(context,tmp_fcatch).IsEmpty()) return;
+                        tmp_p->Catch(context,tmp_fcatch).IsEmpty()) break;
                 }
 
                 if(!feed_base64_encoded(builder,buff.data.get(),buff.length)) {
@@ -1570,18 +1688,17 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                                 isolate,
                                 "invalid base64 encoded data",
                                 NewStringType::kNormal).ToLocalChecked()));
-                    return;
+                    break;
                 }
                 builder.Finish();
 
                 args.GetReturnValue().SetNull();
                 return;
             }
-            break;
         default:
-            assert(itr->second.tag == cached_module::UNCOMPILED_JS);
+            assert(cmod->tag == cached_module::UNCOMPILED_JS);
             {
-                auto &buff = itr->second.data.buff;
+                auto &buff = cmod->data.buff;
                 Local<String> script_str, str_string;
                 if(!(String::NewFromUtf8(
                         isolate,
@@ -1594,71 +1711,107 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                     script_str,
                     ScriptOrigin{str_string}};
                 Local<Script> script;
-                if(!ScriptCompiler::Compile(
-                    context,
-                    &source,
-                    ScriptCompiler::kProduceCodeCache).ToLocal(&script)) goto compile_error;
-                auto cache = source.GetCachedData();
-                auto mod = cache ?
-                    cached_module{to_std_str(isolate,script_str),cache->data,cache->length} :
-                    cached_module{to_std_str(isolate,script_str),nullptr,0};
 
-                {
-                    uvwrap::mutex_scope_lock lock{program->module_cache_lock};
-                    std::swap(mod,itr->second);
+                try {
+                    execute_as_module exec{cc};
+
+                    if(!ScriptCompiler::Compile(
+                        exec.context,
+                        &source,
+                        ScriptCompiler::kProduceCodeCache).ToLocal(&script)) goto compile_error;
+                    auto cache = source.GetCachedData();
+                    auto cmod_b = cache ?
+                        cached_module{to_std_str(isolate,script_str),cache->data,cache->length} :
+                        cached_module{to_std_str(isolate,script_str),nullptr,0};
+
+                    {
+                        uvwrap::mutex_scope_lock lock{program->module_cache_lock};
+                        std::swap(cmod_b,*cmod);
+                    }
+
+                    try {
+                        for(auto &w : cmod_b.data.buff.waiting) {
+                            auto w_cc = program->get_connection(w.cc_id);
+                            if(w_cc) w_cc->register_other_task<module_task>(w.name,w.context_id,node->first);
+                        }
+                    } catch(std::exception &e) {
+                        /* The waiting list was already swapped. At least one thread
+                        is going wait to indefinitely. */
+                        irrecoverable_failure(e);
+                    }
+
+                    args.GetReturnValue().Set(exec(cc,script));
+                } catch(bad_request_js&) {
+                    break;
                 }
-
-                for(auto &w : mod.data.buff.waiting) {
-                    auto w_cc = program->get_connection(w.cc_id);
-                    if(w_cc) w_cc->register_other_task<module_task>(w.name,std_id,w.context_id);
-                }
-
-                Local<Value> r;
-                if(!execute_as_module(cc,script).ToLocal(&r)) return;
-                args.GetReturnValue().Set(r);
+                return;
             }
-            break;
         }
 
+        trycatch.ReThrow();
         return;
 
     compile_error:
-        assert(itr->second.tag == cached_module::UNCOMPILED_JS ||
-            itr->second.tag == cached_module::UNCOMPILED_WASM);
-
-        uvwrap::mutex_scope_lock lock{program->module_cache_lock};
-
-        itr->second.data.buff.started = 0;
-        --cc->compiling;
+        assert(cmod->tag == cached_module::UNCOMPILED_JS ||
+            cmod->tag == cached_module::UNCOMPILED_WASM);
 
         std::vector<waiting_mod_req> waiting;
-        std::swap(waiting,mod.data.buff.waiting);
 
-        if(cc->closed) {
-            // let another thread compile the module
-            for(auto &w : waiting) {
-                auto w_cc = program->get_connection(w.cc_id);
-                if(w_cc) w_cc->register_other_task<module_task>(w.name,std_id,w.context_id);
+        {
+            uvwrap::mutex_scope_lock lock{program->module_cache_lock};
+
+            cmod->data.buff.started = 0;
+            --cc->compiling;
+
+            std::swap(waiting,cmod->data.buff.waiting);
+        }
+
+        try {
+            if(cc->closed) {
+                // let another thread compile the module
+                for(auto &w : waiting) {
+                    auto w_cc = program->get_connection(w.cc_id);
+                    if(w_cc) w_cc->register_other_task<module_task>(w.name,w.context_id,node->first);
+                }
+            } else {
+                std::string msg;
+                {
+                    TryCatch exc_tc{isolate};
+                    String::Utf8Value exc_str{isolate,trycatch.Exception()};
+                    if(*exc_str) {
+                        msg = std::string{*exc_str,static_cast<size_t>(exc_str.length())};
+                    } else {
+                        exc_tc.Reset();
+                        msg = "<failed to convert exception to string>";
+                    }
+                }
+                for(auto &w : waiting) {
+                    auto w_cc = program->get_connection(w.cc_id);
+                    if(w_cc) w_cc->register_other_task<module_error_task>(w.name,node->first->id,msg,w.context_id);
+                }
             }
-        } else {
-            for(auto &w : waiting) {
-                auto w_cc = program->get_connection(w.cc_id);
-                if(w_cc) w_cc->register_other_task<module_error_task>(w.name,std_id,w.context_id);
-            }
+
+            trycatch.ReThrow();
+        } catch(std::exception &e) {
+            /* The waiting list was already swapped. At least one thread is
+            going wait to indefinitely. */
+            irrecoverable_failure(e);
         }
     } catch(std::exception &e) { c_to_js_exception(isolate,e); }
 }
 
-std::pair<unsigned long,v8::Local<v8::Context>> get_context(client_connection *cc,v8::Local<v8::Object> msg) {
-    v8::Local<v8::Value> js_id = check_r(msg->Get(cc->get_str(client_connection::CONTEXT)));
-    if(js_id->IsNullOrUndefined())
-        return cc->new_user_context(true);
+std::pair<unsigned long,v8::Local<v8::Context>> request_task::get_context(v8::Local<v8::Context> request_context) {
+    auto v_itr = values.find(str_context);
+    if(v_itr == values.end()) return client->new_user_context(true);
 
-    int64_t id = check_r(js_id->ToInteger(cc->request_context.Get(cc->isolate)))->Value();
+    auto val = to_value(client->isolate,request_context,v_itr->second);
+    if(val->IsNullOrUndefined()) return client->new_user_context(true);
+
+    int64_t id = check_r(val->ToInteger(request_context))->Value();
     if(id < 0) throw bad_context{};
-    auto itr = cc->contexts.find(static_cast<unsigned long>(id));
-    if(itr == cc->contexts.end()) throw bad_context{};
-    return std::make_pair(itr->first,itr->second.Get(cc->isolate));
+    auto c_itr = client->contexts.find(static_cast<unsigned long>(id));
+    if(c_itr == client->contexts.end()) throw bad_context{};
+    return std::make_pair(c_itr->first,c_itr->second.Get(client->isolate));
 }
 
 std::vector<v8::Local<v8::Value>> get_array_items(v8::Local<v8::Array> x) {
@@ -1667,6 +1820,61 @@ std::vector<v8::Local<v8::Value>> get_array_items(v8::Local<v8::Array> x) {
     r.reserve(length);
     for(uint32_t i=0; i<length; ++i) r.push_back(check_r(x->Get(i)));
     return r;
+}
+
+void call_success(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
+    using namespace v8;
+
+    auto isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+
+    auto cc = reinterpret_cast<client_connection*>(isolate->GetData(0));
+    auto context = isolate->GetCurrentContext();
+
+    if(args.Length() < 1) return;
+
+    Local<Integer> async_id_obj;
+    if(!args.Data()->ToInteger(context).ToLocal(&async_id_obj)) return;
+    auto async_id = static_cast<uint32_t>(async_id_obj->Value());
+
+    TryCatch trycatch(isolate);
+
+    Local<String> json_result;
+    if(JSON::Stringify(context,args[0]).ToLocal(&json_result)) {
+        response_builder b{isolate};
+        b("type","\"asyncresult\"");
+        b("value",*json_result);
+        b("context",client_connection::get_context_id(context));
+        b("id",async_id);
+        b.send(reinterpret_cast<uv_stream_t*>(&cc->client));
+    } else queue_script_exception(
+        reinterpret_cast<uv_stream_t*>(&cc->client),
+        trycatch,
+        isolate,
+        context,
+        Just(async_id));
+}
+
+void call_fail(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
+    using namespace v8;
+
+    auto isolate = args.GetIsolate();
+    HandleScope scope(isolate);
+
+    auto cc = reinterpret_cast<client_connection*>(isolate->GetData(0));
+    auto context = isolate->GetCurrentContext();
+
+    if(args.Length() < 1) return;
+
+    Local<Integer> async_id_obj;
+    if(!args.Data()->ToInteger(context).ToLocal(&async_id_obj)) return;
+
+    queue_script_exception(
+        reinterpret_cast<uv_stream_t*>(&cc->client),
+        args[0],
+        isolate,
+        context,
+        Just(static_cast<uint32_t>(async_id_obj->Value())));
 }
 
 #define CACHED_STR(X) (client->get_str(client_connection::X))
@@ -1695,8 +1903,8 @@ void request_task::Run() {
         switch(type) {
         case EVAL:
             {
-                Local<String> code = check_r(check_r(get_value(str_code,request_context))->ToString(request_context)));
-                auto context = get_context(client,msg);
+                Local<String> code = check_r(check_r(get_value(str_code,request_context))->ToString(request_context));
+                auto context = get_context(request_context);
                 Context::Scope context_scope(context.second);
 
                 Local<Script> compiled;
@@ -1707,7 +1915,7 @@ void request_task::Run() {
                         JSON::Stringify(context.second,result).ToLocal(&json_result)) {
                     response_builder b{client->isolate};
                     b("type","\"result\"");
-                    if(context.first) b("context",context.first);
+                    b("context",context.first);
                     b("value",*json_result).send(stream);
                 } else if(!client->closed) {
                     queue_script_exception(stream,trycatch,client->isolate,context.second);
@@ -1718,14 +1926,14 @@ void request_task::Run() {
             {
                 Local<String> code = check_r(get_value(str_code,request_context)
                     ->ToString(request_context));
-                auto context = get_context(client,msg);
+                auto context = get_context(request_context);
                 Context::Scope context_scope(context.second);
 
                 Local<Script> compiled;
                 if(Script::Compile(context.second,code).ToLocal(&compiled) && !compiled->Run(context.second).IsEmpty()) {
                     response_builder b{client->isolate};
                     b("type","\"success\"");
-                    if(context.first) b("context",context.first);
+                    b("context",context.first);
                     b.send(stream);
                 } else if(!client->closed) {
                     queue_script_exception(stream,trycatch,client->isolate,context.second);
@@ -1734,37 +1942,93 @@ void request_task::Run() {
             break;
         case CALL:
             {
+                bool async = check_r(get_value(str_async,request_context)
+                    ->ToBoolean(request_context))->Value();
                 Local<String> fname = check_r(get_value(str_func,request_context)
                     ->ToString(request_context));
                 Local<Value> tmp = get_value(str_args,request_context);
 
                 if(tmp->IsArray()) {
                     Local<Array> args = Local<Array>::Cast(tmp);
-                    auto context = get_context(client,msg);
+                    auto context = get_context(request_context);
                     Context::Scope context_scope(context.second);
 
                     tmp = check_r(context.second->Global()->Get(context.second,fname));
                     if(tmp->IsFunction()) {
                         Local<Function> func = Local<Function>::Cast(tmp);
                         Local<Value> result;
-                        Local<String> json_result;
                         auto args_v = get_array_items(args);
-                        if(func->Call(context.second,context.second->Global(),static_cast<int>(args_v.size()),args_v.data()).ToLocal(&result) &&
-                                JSON::Stringify(context.second,result).ToLocal(&json_result)) {
-                            response_builder b{client->isolate};
-                            b("type","\"result\"");
-                            b("value",*json_result);
-                            if(context.first) b("context",context.first);
-                            b.send(stream);
-                        } else if(!client->closed) {
-                            queue_script_exception(stream,trycatch,client->isolate,context.second);
+                        if(func->Call(context.second,context.second->Global(),static_cast<int>(args_v.size()),args_v.data()).ToLocal(&result)) {
+                            if(async) {
+                                Local<Promise> p;
+                                if(result->IsPromise()) p = Local<Promise>::Cast(result);
+                                else {
+                                    tmp = check_r(
+                                        check_r(
+                                            check_r(
+                                                context.second->Global()->Get(context.second,CACHED_STR(PROMISE))
+                                            )->ToObject(context.second)
+                                        )->Get(context.second,CACHED_STR(RESOLVE)));
+                                    if(!tmp->IsFunction()) {
+                                        queue_response(
+                                            stream,
+                                            copy_string(R"({"type":"error","errtype":"internal","message":"Promise.resolve is not a function"})"));
+                                        break;
+                                    }
+
+                                    Local<Value> args_a[] = {result};
+                                    if(!Local<Function>::Cast(tmp)->Call(
+                                            context.second,
+                                            context.second->Global(),
+                                            sizeof(args_a)/sizeof(Local<Value>),
+                                            args_a).ToLocal(&result)) {
+                                        goto user_exception;
+                                    }
+                                    if(!result->IsPromise()) {
+                                        queue_response(
+                                            stream,
+                                            copy_string(R"({"type":"error","errtype":"internal","message":"Promise.resolve did not return a promise"})"));
+                                        break;
+                                    }
+                                    p = Local<Promise>::Cast(result);
+                                }
+
+                                auto async_id = client->next_async_id++;
+                                auto closure_val = Integer::NewFromUnsigned(client->isolate,async_id);
+
+                                check_r(
+                                    check_r(p->Then(context.second,
+                                        check_r(Function::New(context.second,&call_success,closure_val)))
+                                    )->Catch(context.second,
+                                        check_r(Function::New(context.second,&call_fail,closure_val))));
+
+                                response_builder b{client->isolate};
+                                b("type","\"resultpending\"");
+                                b("id",async_id);
+                                b("context",context.first);
+                                b.send(stream);
+                            } else {
+                                Local<String> json_result;
+                                if(JSON::Stringify(context.second,result).ToLocal(&json_result)) {
+                                    response_builder b{client->isolate};
+                                    b("type","\"result\"");
+                                    b("value",*json_result);
+                                    b("context",context.first);
+                                    b.send(stream);
+                                } else goto user_exception;
+                            }
+                        } else {
+user_exception:
+                            if(!client->closed) {
+                                queue_script_exception(stream,trycatch,client->isolate,context.second);
+                            }
                         }
                     } else {
                         string_builder b;
                         b.add_string(R"({"type":"error","errtype":"request","message":")");
                         String::Value str_val{client->isolate,fname};
-                        if(!*str_val) throw bad_request{};
-                        b.add_escaped();
+                        if(!*str_val) throw bad_request_js{};
+                        b.add_escaped(str_val);
                         b.add_string(R"( is not a function"})");
                         queue_response(
                             stream,
@@ -1803,14 +2067,11 @@ void request_task::Run() {
         default:
             assert(type == GETSTATS);
             {
-                size_t conn_count;
-                {
-                    uvwrap::read_scope_lock lock{program->connections_lock};
-                    conn_count = program->connections.size();
-                }
                 string_builder b;
                 b.add_string(R"({"type":"result","value":{"connections":)");
-                b.add_integer(conn_count);
+                b.add_integer(program->connection_count());
+                b.add_string(R"(,"cacheitems":)");
+                b.add_integer(program->cache_count());
                 b.add_string("}}");
                 queue_response(
                     stream,
@@ -1823,7 +2084,7 @@ void request_task::Run() {
             queue_response(
                 stream,
                 copy_string(R"({"type":"error","errtype":"memory","message":"insufficient memory"})"));
-    } catch(bad_request&) {
+    } catch(bad_request_js&) {
         if(!client->closed)
             queue_js_exception(stream,trycatch,client->isolate,request_context);
     } catch(bad_context&) {
@@ -1843,6 +2104,9 @@ void module_task::Run() {
     using namespace v8;
 
     if(client->closed) return;
+
+    Locker locker{client->isolate};
+    HandleScope handle_scope{client->isolate};
 
     try {
         auto itr = client->contexts.find(context_id);
@@ -1868,37 +2132,45 @@ void module_task::Run() {
         TryCatch trycatch{client->isolate};
         Local<Value> js_mid = Null(client->isolate);
         try {
-            js_mid = from_std_str(client->isolate,mid);
-            Local<Value> args[] = {
-                js_name,
-                js_mid,
-                check_r(Function::New(context,&getCachedMod,js_mid))
-            };
-            check_r(to_function(client->isolate,check_r(context->Global()->Get(context,CACHED_STR(RESOLVE_MODULE))))->Call(
+            js_mid = from_std_str(client->isolate,cmod->id);
+            Local<Function> resolve_f = check_r(to_function(client->isolate,check_r(context->Global()->Get(context,CACHED_STR(RESOLVE_MODULE)))));
+
+            auto node = client->new_cmod_node(cmod);
+            Local<Function> getcached_f = check_r(Function::New(context,&getCachedMod,node));
+
+            Local<Value> args[] = {js_name,js_mid,getcached_f};
+            check_r(resolve_f->Call(
                 context,
                 context->Global(),
                 sizeof(args)/sizeof(Local<Value>),
                 args));
-        } catch(bad_request&) {
+        } catch(bad_request_js&) {
             if(client->closed || !trycatch.CanContinue()) return;
             if(trycatch.HasTerminated()) client->isolate->CancelTerminateExecution();
             try {
                 Local<Value> args[] = {
                     js_name,
                     js_mid,
-                    check_r(trycatch.Exception().ToString(context))
+                    check_r(trycatch.Exception()->ToString(context))
                 };
-                check_r(to_function(client->isolate,check_r(context->Global()->Get(context,CACHED_STR(FAIL_MODULE))))->Call(
+                check_r(check_r(to_function(client->isolate,check_r(context->Global()->Get(context,CACHED_STR(FAIL_MODULE)))))->Call(
                     context,
                     context->Global(),
                     sizeof(args)/sizeof(Local<Value>),
                     args));
-            } catch(bad_request&) {
+            } catch(bad_request_js&) {
                 if(client->closed) return;
                 fprintf(stderr,"error occurred while trying to report another error\n");
                 client->close_async();
             }
         }
+    } catch(std::bad_alloc&) {
+        fprintf(stderr,"not enough memory to handle request\n");
+
+        /* there's probably not enough memory for this either, but it doesn't
+        hurt to try (if it fails, the process will be shut down, which is what
+        we want) */
+        client->close_async();
     } catch(...) {
         fprintf(stderr,"unexpected error type\n");
         client->close_async();
@@ -1909,6 +2181,9 @@ void module_error_task::Run() {
     using namespace v8;
 
     if(client->closed) return;
+
+    Locker locker{client->isolate};
+    HandleScope handle_scope{client->isolate};
 
     try {
         auto itr = client->contexts.find(context_id);
@@ -1922,15 +2197,15 @@ void module_error_task::Run() {
         auto js_mid = from_std_str(client->isolate,mid);
         Local<Value> args[] = {
             from_std_str(client->isolate,name),
-            Null(client->isolate),
+            js_mid,
             from_std_str(client->isolate,msg)
         };
-        check_r(to_function(client->isolate,check_r(context->Global()->Get(context,CACHED_STR(FAIL_MODULE))))->Call(
+        check_r(check_r(to_function(client->isolate,check_r(context->Global()->Get(context,CACHED_STR(FAIL_MODULE)))))->Call(
             context,
             context->Global(),
             sizeof(args)/sizeof(Local<Value>),
             args));
-    } catch(bad_request&) {
+    } catch(bad_request_js&) {
         if(!client->closed)
             fprintf(stderr,"error occurred while trying to report another error\n");
         client->close_async();
@@ -1945,18 +2220,20 @@ void module_error_task::Run() {
 void program_t::audit_module_cache() noexcept {
     try {
         uvwrap::mutex_scope_lock lock{func_dispatch_lock};
-        for(auto &item : module_cache) {
-            if((item.second.tag == cached_module::UNCOMPILED_JS ||
-                item.second.tag == cached_module::UNCOMPILED_WASM) &&
-                item.second.data.buff.started)
+        for(auto &ptr : module_cache) {
+            auto item = ptr->get(lock);
+            if((item->tag == cached_module::UNCOMPILED_JS ||
+                item->tag == cached_module::UNCOMPILED_WASM) &&
+                item->data.buff.started)
             {
-                auto cc = get_connection(item.second.data.buff.started);
+                auto cc = get_connection(item->data.buff.started);
                 if(!cc) {
-                    item.second.data.buff.started = 0;
-                    for(auto &w : item.second.data.buff.waiting) {
+                    item->data.buff.started = 0;
+                    for(auto &w : item->data.buff.waiting) {
                         auto w_cc = program->get_connection(w.cc_id);
-                        if(w_cc) w_cc->register_other_task<module_task>(w.name,item.first,w.con_id);
+                        if(w_cc) w_cc->register_other_task<module_task>(w.name,w.context_id,ptr);
                     }
+                    item->data.buff.waiting.clear();
                 }
             }
         }
@@ -1965,80 +2242,159 @@ void program_t::audit_module_cache() noexcept {
     }
 }
 
-void program_t::register_task() {
-    almost_json_parser::value_map values;
-    std::swap(values,command_buffer.value);
-    connection_id_t cc_id;
-    unsigned long context_id;
+struct bad_request_error {
+    const char *const msg;
+    bad_request_error(const char *msg) : msg{msg} {}
+};
 
+almost_json_parser::parsed_value &get_parsed_value(command_dispatcher *cd,const std::string &key) {
+    auto val = cd->command_buffer.value.find(key);
+    if(val == cd->command_buffer.value.end()) {
+        throw bad_request_error{"missing value"};
+    }
+    return val->second;
+}
+
+std::string &get_str_value(command_dispatcher *cd,const std::string &key) {
+    auto &val = get_parsed_value(cd,key);
+    if(!val.is_string) throw bad_request_error{"invalid value type"};
+    return val.data;
+}
+
+unsigned long long get_ulonglong_value(command_dispatcher *cd,const std::string &key) {
+    /* it doesn't matter whether the value is a string or not, JS is weakly
+    typed */
+    auto &val = get_parsed_value(cd,key);
     try {
-        cc_id = std::stoull(get_str_value(this,request_task::str_connection));
-        context_id = std::stoull(get_str_value(this,request_task::str_context));
+        return std::stoull(val.data);
     } catch(...) {
-        queue_response(
-            stdout,
-            copy_string(R"({"type":"error","errtype":"request","message":"invalid connection or context id"})"));
-        return;
+        throw bad_request_error{"invalid value type"};
     }
+}
 
-    std::shared_ptr<v8::Task> task;
+void program_t::register_task() {
+    try {
+        int type_i = type_str_to_index(
+            reinterpret_cast<uv_stream_t*>(&stdout.data),
+            MODULE_REQ_COUNT_TYPES,
+            module_request_types);
+        if(type_i == -1) return;
 
-    switch(type) {
-    case MODULE:
-        /* Stash the module data. It will be compiled by one of the
-        connections's threads */
-        {
-            auto &name = get_str_value(this,request_task::str_name);
-            auto &mid = get_str_value(this,request_task::str_id);
-            auto &mtype = get_str_value(this,request_task::str_modtype);
-            auto &data = get_str_value(this,request_task::str_value);
+        auto type = static_cast<module_req_type_t>(type_i);
+        if(type == PURGE_CACHE) {
+            auto itr = command_buffer.value.find(str_ids);
+            if(itr != command_buffer.value.end()) {
+                if(itr->second.is_string) throw bad_request_error{"invalid value type"};
 
-            cached_module::tag_t tag;
-            if(mtype == "js") tag = cachd_module::UNCOMPILED_JS;
-            else if(mtype == "wasm") tag = cached_module::UNCOMPILED_WASM;
-            else {
-                queue_response(
-                    stdout,
-                    copy_string(R"({"type":"error","errtype":"request","message":"invalid module type"})"));
-                break;
-            }
-
-            {
                 uvwrap::mutex_scope_lock lock{module_cache_lock};
-                module_cache.emplace(mid,data.data(),data.size(),tag);
+
+                if(itr->second.data == "null") {
+                    module_cache.clear();
+                } else {
+                    almost_json_parser::array_parser p;
+                    try {
+                        p.feed(itr->second.data.data(),itr->second.data.size());
+                        p.finish();
+                    } catch(almost_json_parser::syntax_error&) {
+                        throw bad_request_error{"invalid JSON"};
+                    }
+
+                    for(auto &item : p.value) {
+                        if(!item.is_string) throw bad_request_error{"invalid value type"};
+                        auto itr = module_cache.find(item.data);
+                        if(itr != module_cache.end()) module_cache.erase(itr);
+                    }
+                }
+
+                return;
             }
-
-            task.reset(new module_task(name,mid,context_id));
         }
-        break;
-    case MODULE_CACHED:
-        task.reset(new module_task(
-            get_str_value(this,request_task::str_name),
-            get_str_value(this,request_task::str_id),
-            context_id));
-        break;
-    default:
-        assert(type == MODULE_ERROR);
-        task.reset(new module_error_task(
-            get_str_value(this,request_task::str_name),
-            get_str_value(this,request_task::str_msg),
-            context_id));
-        break;
-    }
 
-    auto cc = get_connection(cc_id);
+        connection_id_t cc_id;
+        unsigned long context_id;
 
-    if(cc) {
-        cc->tloop.add_task(task);
+        try {
+            cc_id = get_ulonglong_value(this,str_connection);
+            context_id = static_cast<unsigned long>(get_ulonglong_value(this,str_context));
+        } catch(...) {
+            throw bad_request_error{"invalid connection or context id"};
+        }
+
+        std::unique_ptr<v8::Task> task;
+
+        auto cc = get_connection(cc_id);
+
+        switch(type) {
+        case MODULE:
+            /* Stash the module data. It will be compiled by one of the
+            connections's threads */
+            {
+                auto &name = get_str_value(this,str_name);
+                auto &mid = get_str_value(this,str_id);
+                auto &mtype = get_str_value(this,str_modtype);
+                auto &data = get_str_value(this,str_value);
+
+                cached_module::tag_t tag;
+                if(mtype == "js") tag = cached_module::UNCOMPILED_JS;
+                else if(mtype == "wasm") tag = cached_module::UNCOMPILED_WASM;
+                else throw bad_request_error{"invalid module type"};
+                if(data.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                    throw bad_request_error{"payload too large"};
+                }
+
+                auto cmod = std::make_shared<module_cache_item>(
+                    mid,
+                    data.data(),
+                    static_cast<int>(data.size()),
+                    tag);
+
+                {
+                    uvwrap::mutex_scope_lock lock{module_cache_lock};
+                    module_cache.insert(cmod);
+                }
+
+                if(cc) task.reset(new module_task(cc,name,context_id,cmod));
+            }
+            break;
+        case MODULE_CACHED:
+            if(cc) {
+                auto &mid = get_str_value(this,str_id);
+
+                std::shared_ptr<module_cache_item> cmod;
+                {
+                    uvwrap::mutex_scope_lock lock{module_cache_lock};
+                    auto itr = program->module_cache.find(mid);
+                    if(itr != program->module_cache.end()) cmod = *itr;
+                }
+                if(!cmod) throw bad_request_error{"no such module"};
+
+                task.reset(new module_task(
+                    cc,
+                    get_str_value(this,str_name),
+                    context_id,
+                    cmod));
+            }
+            break;
+        default:
+            assert(type == MODULE_ERROR);
+            if(cc) task.reset(new module_error_task(
+                cc,
+                get_str_value(this,str_name),
+                "",
+                get_str_value(this,str_msg),
+                context_id));
+            break;
+        }
+
+        if(cc) cc->tloop.add_task(std::move(task));
+    } catch(bad_request_error &e) {
+        string_builder b;
+        b.add_string(R"({"type":"error","errtype":"request","message":")");
+        b.add_escaped_ascii(e.msg);
+        b.add_string("\"}");
         queue_response(
             stdout,
-            copy_string(R"({"type":"success","connectionalive":"true"})"));
-    } else {
-        /* The connection no longer exists, but we keep the module data;
-        another connection can request it. */
-        queue_response(
-            stdout,
-            copy_string(R"({"type":"success","connectionalive":"false"})"));
+            b.get_string());
     }
 }
 
@@ -2051,7 +2407,7 @@ void on_new_connection(uv_stream_t *server_,int status) noexcept {
     try {
         auto cc = new client_connection;
 
-        ASSERT_UV_RESULT(uv_accept(server_,reinterpret_cast<uv_stream_t*>(&cc->client.data)));
+        ASSERT_UV_RESULT(uv_accept(server_,cc->client.as_uv_stream()));
 
         cc->client.read_start(
             [](uv_stream_t *s,ssize_t read,const uv_buf_t *buf) {
@@ -2106,16 +2462,16 @@ program_t::program_t(const char *progname) :
     sig_request{main_loop},
     stdin{main_loop},
     stdout{main_loop},
+    snapshot{create_snapshot()},
+    next_conn_index{0},
+    shutting_down{false},
     func_dispatcher{
         main_loop,
         [](uv_async_t *handle) {
             reinterpret_cast<program_t*>(handle->data)->run_functions();
         },
         this
-    },
-    snapshot{create_snapshot()},
-    next_conn_index{0},
-    shutting_down{false}
+    }
 {
     if(!snapshot.data) {
         throw std::runtime_error("failed to create start-up snapshot");
@@ -2144,6 +2500,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if(uv_guess_handle(0) == UV_FILE) {
+        // libuv will abort if uv_read_start is used on a file
+        fprintf(stderr,"standard-in cannot be a file\n");
+        return 1;
+    }
+
     try {
         program_t p{argv[0]};
         program = &p;
@@ -2158,11 +2520,16 @@ int main(int argc, char* argv[]) {
         });
         p.stdout.open(1);
 
-        /* this is to let a parent process know that a socket/pipe is ready */
-        printf("ready\n");
+        /* This is to let a parent process know that a socket/pipe is ready.
+        fwrite is used because we need to include the nul character in the
+        output. */
+        const char msg[] = "{\"type\":\"ready\"}";
+        fwrite(msg,1,sizeof(msg),stdout);
         fflush(stdout);
 
         p.main_loop.run(UV_RUN_DEFAULT);
+
+        assert(_alloc_count.load() == 0);
     } catch(std::exception &e) {
         fprintf(stderr,"%s\n",e.what());
         return 2;

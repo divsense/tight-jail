@@ -108,8 +108,6 @@ class JailContext {
             case 'error':
                 reject(new InternalJailError(msg.message));
                 break;
-            case 'import':
-                break;
             default:
                 reject(new InternalJailError('unknown result type'));
                 break;

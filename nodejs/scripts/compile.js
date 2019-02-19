@@ -29,10 +29,9 @@ for(let i=0; i<v8_ninja_names.length; ++i)
 
 const v8_aux_files = ['icudtl.dat','natives_blob.bin','snapshot_blob.bin'];
 
-const gcc_config = {
-    CXXFLAGS: '-std=c++0x -O2 -Wall -pthread -fstack-protector-strong',
-    CPPFLAGS: '-DNDEBUG',
-    LDFLAGS: '-pthread -s -Wl,-z,now -Wl,-z,relro',
+const gcc_config_common = {
+    CXXFLAGS: '-std=c++14 -Wall -pthread -fstack-protector-strong',
+    LDFLAGS: '-pthread -Wl,-z,now -Wl,-z,relro',
     LDLIBS: '-luv',
     NAME_FLAG: '-o',
     PREPROCESS_FLAG: '-E -P',
@@ -41,9 +40,14 @@ const gcc_config = {
     LINCLUDE_DOT: '-Wl,-rpath=.',
     make_lib(x) { return '-l'+x; }};
 
-const msvc_config = {
-    CXXFLAGS: '/nologo /Ox /EHsc /GL /GS /volatile:iso /W4 /wd4100 /wd4706',
-    CPPFLAGS: '/DNDEBUG',
+const gcc_config = Object.assign({CPPFLAGS: '-DNDEBUG'},gcc_config_common);
+gcc_config.CXXFLAGS += ' -O2';
+gcc_config.LDFLAGS += ' -s';
+const gcc_config_debug = Object.assign({},gcc_config_common);
+gcc_config_debug.CXXFLAGS += ' -O0 -g';
+
+const msvc_config_common = {
+    CXXFLAGS: '/nologo /EHsc /GL /GS /volatile:iso /W4 /wd4100 /wd4706',
     LDFLAGS: '/MT /link',
     LDLIBS: 'libuv.lib Ws2_32.lib Advapi32.lib User32.lib Psapi.lib Iphlpapi.lib Userenv.lib',
     NAME_FLAG: '/Fe',
@@ -51,6 +55,11 @@ const msvc_config = {
     INCLUDEPATH_FLAG: '/I',
     LINCLUDE_DOT: '' /* the current directory is always searched on Windows */,
     make_lib(x) { return x+'.lib'; }};
+
+const msvc_config = Object.assign({CPPFLAGS: '/DNDEBUG'},msvc_config_common);
+msvc_config.CXXFLAGS += ' /Ox'
+const msvc_config_debug = Object.assign({},msvc_config_common);
+msvc_config_debug.CXXFLAGS += ' /Od /Zi'
 
 const ov = {overwrite: true};
 
@@ -66,7 +75,7 @@ function execShell(command,options,resolve,reject,retFunc = null) {
         shell = process.env.COMSPEC || 'cmd.exe';
 
         /* Node's argument escaping seems to mess up our escaping, hence the
-        need the extra quotes and windowsVerbatimArguments */
+        need for the extra quotes and windowsVerbatimArguments */
         args = ['/D','/C','"'+command+'"'];
         options = Object.assign({windowsVerbatimArguments: true},options || {});
     } else {
@@ -331,6 +340,9 @@ function readNinja(config) {
         else config.shell_quote =
             x => "'" + x.replace("'","\\'") + "'";
 
+        var debug = process.env.npm_config_DEBUG || process.env.DEBUG || 'false';
+        debug = ['true','yes','1'].includes(debug);
+
         config.tools = process.env.npm_config_TOOLS || process.env.TOOLS;
         if(!(config.tools && TOOLSETS.includes(config.tools))) {
             config.tools = os.platform == 'win32' ? 'msvc' : 'gcc';
@@ -339,11 +351,11 @@ function readNinja(config) {
         switch(config.tools) {
         case 'clang':
         case 'gcc':
-            Object.assign(config,gcc_config);
+            Object.assign(config,debug ? gcc_config_debug : gcc_config);
             config.CXX = config.tools == 'clang' ? 'clang++' : 'g++';
             break;
         case 'msvc':
-            Object.assign(config,msvc_config);
+            Object.assign(config,debug ? msvc_config_debug : msvc_config);
             config.CXX = 'cl.exe';
             break;
         case 'none':

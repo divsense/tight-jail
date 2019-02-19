@@ -160,13 +160,28 @@ namespace uvwrap {
     struct pipe_t {
         uv_pipe_t data;
 
+        uv_handle_t *as_uv_handle() {
+            return reinterpret_cast<uv_handle_t*>(&data);
+        }
+
+        uv_stream_t *as_uv_stream() {
+            return reinterpret_cast<uv_stream_t*>(&data);
+        }
+
         pipe_t(loop_t &loop,bool ipc=false) {
             check_err(uv_pipe_init(&loop.data,&data,ipc ? 1 : 0));
         }
 
-        ~pipe_t() {
-            uv_close(reinterpret_cast<uv_handle_t*>(&data),nullptr);
+        pipe_t(loop_t &loop,bool ipc,void *user_ptr) {
+            check_err(uv_pipe_init(&loop.data,&data,ipc ? 1 : 0));
+            data.data = user_ptr;
         }
+
+        pipe_t(loop_t &loop,void *user_ptr) {
+            check_err(uv_pipe_init(&loop.data,&data,0));
+            data.data = user_ptr;
+        }
+
 
         void bind(const char *name) {
             check_err(uv_pipe_bind(&data,name));
@@ -181,14 +196,12 @@ namespace uvwrap {
         }
 
         void accept(pipe_t &client) {
-            check_err(uv_accept(
-                reinterpret_cast<uv_stream_t*>(&data),
-                reinterpret_cast<uv_stream_t*>(&client.data)));
+            check_err(uv_accept(as_uv_stream(),client.as_uv_stream()));
         }
 
         void read_start(uv_read_cb read) {
             check_err(uv_read_start(
-                reinterpret_cast<uv_stream_t*>(&data),
+                as_uv_stream(),
                 [](uv_handle_t *h,size_t suggest_s,uv_buf_t *buf) {
                     *buf = uv_buf_init(new char[suggest_s],static_cast<unsigned int>(suggest_s));
                 },
@@ -196,11 +209,30 @@ namespace uvwrap {
         }
 
         void read_stop() {
-            check_err(uv_read_stop(reinterpret_cast<uv_stream_t*>(&data)));
+            check_err(uv_read_stop(as_uv_stream()));
         }
 
         void read_stop(std::nothrow_t) noexcept {
-            ASSERT_UV_RESULT(uv_read_stop(reinterpret_cast<uv_stream_t*>(&data)));
+            ASSERT_UV_RESULT(uv_read_stop(as_uv_stream()));
+        }
+
+    protected:
+        ~pipe_t() {}
+    };
+
+    struct pipe_t_auto : pipe_t {
+        using pipe_t::pipe_t;
+
+        ~pipe_t_auto() {
+            uv_close(as_uv_handle(),nullptr);
+        }
+    };
+
+    struct pipe_t_manual : pipe_t {
+        using pipe_t::pipe_t;
+
+        void close(uv_close_cb callback=nullptr) {
+            uv_close(as_uv_handle(),callback);
         }
     };
 }
