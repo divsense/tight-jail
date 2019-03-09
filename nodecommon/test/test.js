@@ -8,17 +8,75 @@ function sleep(ms) {
 }
 
 function moduleResolver(mid) {
+    let m;
     switch(mid) {
     case 'a':
+    case 'not_a':
+    case 'w':
+    case null:
         return 'exports.square = x => x * x;';
+    case 'b':
+        return Promise.resolve('exports.cube = x => x * x * x;');
+    case 'c':
+        /*
+        (module
+          (func (export "fourthPow") (param i32) (result i32)
+            get_local 0
+            get_local 0
+            get_local 0
+            get_local 0
+            i32.mul
+            i32.mul
+            i32.mul
+          )
+        )
+        */
+        return Buffer.from([
+            0,0x61,0x73,0x6d,0x01,0,0,0,0x01,0x06,0x01,0x60,0x01,0x7f,0x01,0x7f,
+            0x03,0x02,0x01,0,0x07,0x0d,0x01,0x09,0x66,0x6f,0x75,0x72,0x74,0x68,
+            0x50,0x6f,0x77,0,0,0x0a,0x0f,0x01,0x0d,0,0x20,0,0x20,0,0x20,0,0x20,
+            0,0x6c,0x6c,0x6c,0x0b]);
+    case 'd':
+        return 'exports.square = UNDEFINED_VALUE;';
+    case 'e':
+        return 'exports.square BAD SYNTAX;';
+    case 'f':
+        return Buffer.from([0,1,2,3,4]);
+    case 'z':
+        throw new Error('something');
+    case 'x':
+        return Promise.resolve(null);
+    case 'v':
+        return new Promise((resolve,reject) => { reject(new Error('something else')); });
     default:
+        m = /times([0-9]+)/.exec(mid);
+        if(m) return 'exports.mult = x => x * ' + m[1]; + ';';
         return null;
     }
 }
 
+function countingModResolver(results) {
+    return mid => {
+        let c = results[mid];
+        results[mid] = 1 + (c || 0);
+        return moduleResolver(mid);
+    };
+}
+
 function moduleNameNormalizer(name) {
-    if(name == 'z') return null;
-    return name.toLowerCase();
+    name = name.toLowerCase();
+    switch(name) {
+    case 'not_a':
+        return null;
+    case 'y':
+        throw new Error('nothing');
+    case 'w':
+        return Promise.resolve(null);
+    case 'u':
+        return new Promise((resolve,reject) => { reject(new Error('nothing else')); });
+    default:
+        return name;
+    }
 }
 
 function commonTests(C) {
@@ -137,24 +195,43 @@ describe('tight-jail',function () {
             var j = new jail.JailContext();
             try {
                 j.exec('async function X(a) { return a*5; }' +
-                    'async function Y(a) { return await X(a+2); }');
-                var result = await j.call('Y',[2],true);
-                assert.equal(result,20);
+                    'async function Y(a) { return await X(a+2); }' +
+                    'function Z() { return new Promise((resolve,reject) => { reject(new Error("yo")); }) }');
+
+                assert.equal(await j.call('Y',[2],true),20);
+                await assert.isRejected(j.call('Z',[],true),jail.ClientError);
             } finally {
                 j.close();
             }
         });
 
-        it('should be able to import modules',async function () {
+        it('should be able to import JS modules',async function () {
             jail.purgeCache();
             jail.setModuleLoader(moduleResolver);
             var j = new jail.JailContext();
             try {
                 j.exec('async function X(a) {' +
                            'var m = await jimport("a");' +
-                           'return m.square(a); }');
-                var result = await j.call('X',[3],true);
-                assert.equal(result,9);
+                           'return m.square(a); }' +
+                       'async function Y(a) {' +
+                           'var m = await jimport("b");' +
+                           'return m.cube(a); }');
+                assert.equal(await j.call('X',[3],true),9);
+                assert.equal(await j.call('Y',[4],true),64);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should be able to import WASM modules',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver);
+            var j = new jail.JailContext();
+            try {
+                j.exec('async function X(a) {' +
+                           'var m = await jimport("c");' +
+                           'return m.fourthPow(a); }');
+                assert.equal(await j.call('X',[7],true),2401);
             } finally {
                 j.close();
             }
@@ -165,7 +242,196 @@ describe('tight-jail',function () {
             jail.setModuleLoader(moduleResolver);
             var j = new jail.JailContext();
             try {
-                assert.isOk(await j.eval('jimport("a") === jimport("a")'));
+                await j.exec('async function X(mod1,mod2) {' +
+                                 'var a = await jimport(mod1);' +
+                                 'var b = await jimport(mod2);' +
+                                 'return a === b; }')
+                assert.isOk(await j.call('X',['a','a'],true));
+                assert.isOk(await j.call('X',['b','b'],true));
+                assert.isNotOk(await j.call('X',['a','b'],true));
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should be able to normalize module names',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver,moduleNameNormalizer);
+            var j = new jail.JailContext();
+            try {
+                await j.exec('async function X(mod1,mod2) {' +
+                                 'var a = await jimport(mod1);' +
+                                 'var b = await jimport(mod2);' +
+                                 'return a === b; }')
+                assert.isOk(await j.call('X',['a','A'],true));
+                assert.isOk(await j.call('X',['b','B'],true));
+                assert.isNotOk(await j.call('X',['a','b'],true));
+            } finally {
+                j.close();
+            }
+        });
+
+        it('cache should persist across contexts',async function () {
+            jail.purgeCache();
+            var counts = {};
+            jail.setModuleLoader(countingModResolver(counts));
+            const code = 'async function X(x) { return (await jimport("a")).square(x); }\n' +
+                'async function Y(x) { return (await jimport("c")).fourthPow(x); }';
+
+            var j = new jail.JailContext();
+            try {
+                j.exec(code)
+                assert.equal(await j.call('X',[4],true),16);
+                assert.equal(await j.call('Y',[4],true),256);
+                assert.equal(counts['a'],1);
+                assert.equal(counts['c'],1);
+            } finally {
+                j.close();
+            }
+
+            var j = new jail.JailContext();
+            try {
+                j.exec(code)
+                assert.equal(await j.call('X',[6],true),36);
+                assert.equal(await j.call('Y',[6],true),1296);
+                assert.equal(counts['a'],1);
+                assert.equal(counts['c'],1);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should be able to clear the cache',async function () {
+            jail.purgeCache();
+            var counts = {};
+            jail.setModuleLoader(countingModResolver(counts));
+            const code = 'async function X(x) { return (await jimport("a")).square(x); }';
+
+            var j = new jail.JailContext();
+            try {
+                assert.equal((await j.getStats()).cacheitems,0);
+                j.exec(code)
+                assert.equal(await j.call('X',[6],true),36);
+                assert.equal(counts['a'],1);
+                assert.equal(await j.call('X',[7],true),49);
+                assert.equal(counts['a'],1);
+                assert.equal((await j.getStats()).cacheitems,1);
+            } finally {
+                j.close();
+            }
+
+            jail.purgeCache();
+            var j = new jail.JailContext();
+            try {
+                assert.equal((await j.getStats()).cacheitems,0);
+                j.exec(code)
+                assert.equal(await j.call('X',[8],true),64);
+                assert.equal(counts['a'],2);
+                assert.equal((await j.getStats()).cacheitems,1);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should be able to remove individual items from the cache',async function () {
+            jail.purgeCache();
+            var counts = {};
+            jail.setModuleLoader(countingModResolver(counts));
+            const code = 'async function X(x) {' +
+                'return (await jimport("a")).square(x) + (await jimport("b")).cube(x); }';
+
+            var j = new jail.JailContext();
+            try {
+                assert.equal((await j.getStats()).cacheitems,0);
+                j.exec(code)
+                assert.equal(await j.call('X',[2],true),12);
+                assert.equal(counts['a'],1);
+                assert.equal(counts['b'],1);
+                assert.equal((await j.getStats()).cacheitems,2);
+            } finally {
+                j.close();
+            }
+
+            jail.purgeCache(['a']);
+            var j = new jail.JailContext();
+            try {
+                assert.equal((await j.getStats()).cacheitems,1);
+                j.exec(code)
+                assert.equal(await j.call('X',[3],true),36);
+                assert.equal(counts['a'],2);
+                assert.equal(counts['b'],1);
+                assert.equal((await j.getStats()).cacheitems,2);
+            } finally {
+                j.close();
+            }
+        });
+
+        it('errors thrown by the loader should be passed to the jailed code',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver,moduleNameNormalizer);
+            var j = new jail.JailContext();
+            try {
+                j.exec('async function X(mod) { try { await jimport(mod); return false; } catch(e) { return true; } }');
+                assert.isOk(await j.call('X',['z'],true));
+                assert.isOk(await j.call('X',['y'],true));
+                assert.isOk(await j.call('X',['v'],true));
+                assert.isOk(await j.call('X',['u'],true));
+                assert.isNotOk(await j.call('X',['a'],true));
+            } finally {
+                j.close();
+            }
+        });
+
+        it('returning null in the loader should cause a module-not-found error',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver,moduleNameNormalizer);
+            var j = new jail.JailContext();
+            try {
+                j.exec('async function X(mod) { try { await jimport(mod); return false; }' +
+                    ' catch(e) { return e.toString() == "JailImportError: module not found"; } }');
+                assert.isOk(await j.call('X',['not_b'],true));
+
+                /* this one is important because moduleNameNormalizer('not_a')
+                returns null but moduleResolver('not_a') and
+                moduleResolver(null) does not */
+                assert.isOk(await j.call('X',['not_a'],true));
+
+                assert.isOk(await j.call('X',['x'],true));
+                assert.isOk(await j.call('X',['w'],true));
+
+                assert.isNotOk(await j.call('X',['a'],true));
+            } finally {
+                j.close();
+            }
+        });
+
+        it('cache size should not exceed maximum',async function () {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver,null,5);
+
+            let j = new jail.JailContext();
+            try {
+                j.exec('async function X(mod) { return (await jimport(mod)).mult(5); }')
+                for(let i=0; i<10; ++i) {
+                    assert.equal(await j.call('X',['times' + i],true),5 * i);
+                    assert.equal((await j.getStats()).cacheitems,Math.min(i + 1,5));
+                }
+            } finally {
+                j.close();
+            }
+        });
+
+        it('should handle invalid modules gracefully',async function() {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver);
+            var j = new jail.JailContext();
+            try {
+                j.exec('async function X(mod) { try { await jimport(mod); return false; }' +
+                    ' catch(e) { return e instanceof JailImportError; } }');
+                assert.isOk(await j.call('X',['d'],true));
+                assert.isOk(await j.call('X',['e'],true));
+                assert.isOk(await j.call('X',['f'],true));
+                assert.isNotOk(await j.call('X',['a'],true));
             } finally {
                 j.close();
             }

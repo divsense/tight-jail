@@ -10,7 +10,7 @@ const child_process = require('child_process');
 const CONFIG_LOG_NAME = 'cfg_test_log.txt';
 const OUTPUTNAMEBASE = 'jsjaild';
 const SOURCE_DEST_FOLDER = 'daemon';
-const SOURCES = ['main.cpp','almost_json_parser.cpp'];
+const SOURCES = ['main.cpp','almost_json_parser.cpp','task_loop.cpp'];
 const TOOLSETS = ['clang','gcc','msvc','none'];
 
 // v8 builds its own libc++

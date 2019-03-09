@@ -28,7 +28,7 @@ namespace uvwrap {
         const char *what() const noexcept override { return uv_strerror(code); }
     };
 
-    void check_err(int r) {
+    inline void check_err(int r) {
         if(r) throw uv_error{r};
     }
 
@@ -71,6 +71,10 @@ namespace uvwrap {
 
         void send() {
             check_err(uv_async_send(&data));
+        }
+
+        void send(std::nothrow_t) {
+            ASSERT_UV_RESULT(uv_async_send(&data));
         }
     };
 
@@ -233,6 +237,31 @@ namespace uvwrap {
 
         void close(uv_close_cb callback=nullptr) {
             uv_close(as_uv_handle(),callback);
+        }
+    };
+
+    struct timer_t {
+        uv_timer_t data;
+
+        uv_handle_t *as_uv_handle() {
+            return reinterpret_cast<uv_handle_t*>(&data);
+        }
+
+        timer_t(loop_t &loop) {
+            check_err(uv_timer_init(&loop.data,&data));
+        }
+
+        timer_t(loop_t &loop,void *user_ptr) {
+            check_err(uv_timer_init(&loop.data,&data));
+            data.data = user_ptr;
+        }
+
+        ~timer_t() {
+            uv_close(as_uv_handle(),nullptr);
+        }
+
+        void start(uv_timer_cb callback,uint64_t timeout,uint64_t repeat=0) {
+            check_err(uv_timer_start(&data,callback,timeout,repeat));
         }
     };
 }

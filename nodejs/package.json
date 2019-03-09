@@ -7,6 +7,8 @@
     "daemon/main.cpp",
     "daemon/almost_json_parser.hpp",
     "daemon/almost_json_parser.cpp",
+    "daemon/task_loop.hpp",
+    "daemon/task_loop.cpp",
     "scripts/*",
     "test/*"
   ],

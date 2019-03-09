@@ -1,5 +1,6 @@
 'use strict';
 
+const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const child_process = require('child_process');
@@ -74,6 +75,14 @@ class UniqueFIFO {
         return this._map.get(value) !== undefined;
     }
 
+    delete(value) {
+        let item = this._map.get(value);
+        if(item !== undefined) {
+            this._map.delete(value);
+            this._list.removeNode(item);
+        }
+    }
+
     clear() {
         this._list = dlist.create();
         this._map.clear();
@@ -104,9 +113,6 @@ class JailConnection {
                 }
             }
         };
-    }
-
-    static _importSuccess(data,mod) {
     }
 
     static _importError(data,err) {
@@ -144,6 +150,8 @@ class JailConnection {
             JailConnection._importNotFound(data);
             return;
         }
+
+        mid = mid.toString();
 
         let msg = {
             connection: data.connection,
@@ -195,6 +203,41 @@ class JailConnection {
         if(excess.length) JailConnection._purgeCache(excess);
     }
 
+    static _setupProc() {
+        JailConnection._server_proc.stdout.setEncoding('utf8');
+
+        JailConnection._server_proc.stdout.on('data',JailConnection._processChunks(msg => {
+            let data;
+            try {
+                data = JSON.parse(msg);
+            } catch(e) {
+                JailConnection._backgroundError('mangled result in importer stream');
+                return;
+            }
+
+            if(JailConnection._proc_ready) {
+                switch(data.type) {
+                case 'import':
+                    JailConnection._handleImport(data);
+                    break;
+                case 'error':
+                    JailConnection._backgroundError('error in importer stream: ' + data.message);
+                    break;
+                default:
+                    JailConnection._backgroundError('unknown result type in importer stream');
+                    break;
+                }
+            } else {
+                //console.log('jail process ready');
+
+                console.assert(data.type == 'ready');
+                JailConnection._proc_ready = true;
+                JailConnection._pending_init.forEach(inst => { inst._init_connection(); });
+                JailConnection._pending_init = null;
+            }
+        }));
+    }
+
     constructor(autoClose=false) {
         this.autoClose = autoClose;
         this._server = null;
@@ -205,73 +248,48 @@ class JailConnection {
         // the rest of the initialization waits until the jail process starts
         if(JailConnection._proc_ready) {
             this._init_connection();
-        } else if(process.env.JAIL_PROCESS_SOCKET) {
-            JailConnection._socketName = process.env.JAIL_PROCESS_SOCKET;
-            JailConnection._proc_ready = true;
-            this._init_connection();
         } else {
             JailConnection._pending_init.add(this);
 
             if(!JailConnection._server_proc) {
-                //console.log('starting jail process');
-
-                let options = {
-// #if this.NODEONLY
-                    stdio: ['pipe','pipe','inherit','ipc'],
-                    execArgv: ['--experimental-worker'],
-// #else
-                    stdio: ['pipe','pipe','inherit'],
-                    cwd: SERVER_DIR,
-// #endif
-                    windowsHide: true
-                };
-                if(JailConnection._uid !== null) options.uid = JailConnection._uid;
-                if(JailConnection._gid !== null) options.gid = JailConnection._gid;
-
-// #if this.NODEONLY
-                JailConnection._server_proc = child_process.fork(
-                    path.join(__dirname,'jailed.js'),
-                    options);
-// #else
-                JailConnection._server_proc = child_process.spawn(
-                    SERVER_PATH,
-                    [JailConnection._getSocketName()],
-                    options);
-// #endif
-
-                JailConnection._server_proc.stdout.setEncoding('utf8');
-                JailConnection._server_proc.stdin.setEncoding('utf8');
-
-                JailConnection._server_proc.stdout.on('data',JailConnection._processChunks(msg => {
-                    let data;
-                    try {
-                        data = JSON.parse(msg);
-                    } catch(e) {
-                        JailConnection._backgroundError('mangled result in importer stream');
-                        return;
-                    }
-
-                    if(JailConnection._proc_ready) {
-                        switch(data.type) {
-                        case 'import':
-                            JailConnection._handleImport(data);
-                            break;
-                        case 'error':
-                            JailConnection._backgroundError('error in importer stream: ' + data.message);
-                            break;
-                        default:
-                            JailConnection._backgroundError('unknown result type in importer stream');
-                            break;
+                if(process.env.JAIL_PROCESS_SOCKET) {
+                    JailConnection._socketName = process.env.JAIL_PROCESS_SOCKET;
+                    JailConnection._server_proc = {
+                        stdin: fs.createWriteStream(JailConnection._socketName + '_stdin'),
+                        stdout: fs.createReadStream(JailConnection._socketName + '_stdout'),
+                        kill(x) {
+                            this.stdin.close();
+                            this.stdout.close();
                         }
-                    } else {
-                        //console.log('jail process ready');
+                    };
+                } else {
+                    //console.log('starting jail process');
 
-                        console.assert(data.type == 'ready');
-                        JailConnection._proc_ready = true;
-                        JailConnection._pending_init.forEach(inst => { inst._init_connection(); });
-                        JailConnection._pending_init = null;
-                    }
-                }));
+                    let options = {
+// #if this.NODEONLY
+                        stdio: ['pipe','pipe','inherit','ipc'],
+                        execArgv: ['--experimental-worker'],
+// #else
+                        stdio: ['pipe','pipe','inherit'],
+                        cwd: SERVER_DIR,
+// #endif
+                        windowsHide: true
+                    };
+                    if(JailConnection._uid !== null) options.uid = JailConnection._uid;
+                    if(JailConnection._gid !== null) options.gid = JailConnection._gid;
+
+// #if this.NODEONLY
+                    JailConnection._server_proc = child_process.fork(
+                        path.join(__dirname,'jailed.js'),
+                        options);
+// #else
+                    JailConnection._server_proc = child_process.spawn(
+                        SERVER_PATH,
+                        [JailConnection._getSocketName()],
+                        options);
+// #endif
+                }
+                JailConnection._setupProc();
             }
         }
     }
@@ -472,10 +490,12 @@ function purgeCache(items=null) {
     if(!JailConnection._server_proc) return;
 
     if(isSomething(items)) {
-        if(!items.size) return;
-        if(!(items instanceof Array)) items = Array.from(items);
+        items = Array.from(items,x => x.toString());
+        if(!items.length) return;
+        for(let item of items) JailConnection._modCache.delete(item);
     } else {
         items = null;
+        JailConnection._modCache.clear();
     }
 
     JailConnection._purgeCache(items);
