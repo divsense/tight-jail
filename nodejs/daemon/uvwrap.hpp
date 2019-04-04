@@ -264,6 +264,30 @@ namespace uvwrap {
             check_err(uv_timer_start(&data,callback,timeout,repeat));
         }
     };
+
+    struct cond_t {
+        uv_cond_t data;
+
+        cond_t() {
+            check_err(uv_cond_init(&data));
+        }
+
+        ~cond_t() {
+            uv_cond_destroy(&data);
+        }
+
+        void signal() {
+            uv_cond_signal(&data);
+        }
+
+        void broadcast() {
+            uv_cond_broadcast(&data);
+        }
+
+        void wait(mutex_t &m) {
+            uv_cond_wait(&data,&m.data);
+        }
+    };
 }
 
 #endif

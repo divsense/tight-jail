@@ -90,7 +90,7 @@ function jimport(m) {
   return new Promise((resolve,reject) => {
     let r = __moduleCacheByName[m];
     if(r === null) reject(new JailImportError('module not found'));
-    else if(r instanceof __PendingMod) r.add([resolve,reject]);
+    else if(r instanceof __PendingMod) r.add(resolve,reject);
     else if(r === undefined) {
       __moduleCacheByName[m] = new __PendingMod(resolve,reject);
       __sendImportMessage(m);
@@ -102,13 +102,8 @@ function jimport(m) {
 function __resolveModule(name,mid,getCachedGlobal) {
   let pending = __moduleCacheByName[name];
   let r = __moduleCacheById[mid];
-  if(r instanceof __PendingMod) {
-    if(pending !== r) {
-      r.mergeFrom(pending,name);
-      __moduleCacheByName[name] = r;
-      pending.aliases.forEach(item => { __moduleCacheByName[item] = r; });
-    }
-  } else if(r === undefined) {
+
+  if(r === undefined || r === pending) {
     try {
       r = getCachedGlobal(name);
     } catch(e) {
@@ -117,13 +112,17 @@ function __resolveModule(name,mid,getCachedGlobal) {
     }
 
     if(r === null) {
-      /* The module is being compiled. This function or __resolveReadyModule
-      will be called when the module is ready. */
+      /* The module is being compiled. __resolveReadyModule will be called when
+      the module is ready. */
       __moduleCacheById[mid] = pending;
     } else {
       __moduleCacheById[mid] = r;
       pending.resolve(r,name);
     }
+  } else if(r instanceof __PendingMod) {
+    r.mergeFrom(pending,name);
+    __moduleCacheByName[name] = r;
+    for(let a of pending.aliases) __moduleCacheByName[a] = r;
   } else {
     pending.resolve(r,name);
   }
@@ -207,7 +206,7 @@ struct uncompiled_buffer {
     std::vector<waiting_mod_req> waiting;
 };
 struct cached_module {
-    enum tag_t {UNCOMPILED_WASM_BASE64,UNCOMPILED_WASM,UNCOMPILED_JS,WASM,JS} tag;
+    enum tag_t {UNCOMPILED_WASM_BASE64,UNCOMPILED_WASM,UNCOMPILED_JS,WASM,JS,TYPE_COUNT} tag;
     union data_t {
         v8::WasmCompiledModule::TransferrableModule wasm;
         js_cache js;
@@ -216,6 +215,8 @@ struct cached_module {
         data_t() {}
         ~data_t() {}
     } data;
+
+    static const char *tag_names[TYPE_COUNT];
 
     cached_module(v8::WasmCompiledModule::TransferrableModule &&wasm) : tag{WASM} {
         new(&data.wasm) v8::WasmCompiledModule::TransferrableModule(std::move(wasm));
@@ -285,6 +286,13 @@ private:
         }
     }
 };
+
+const char *cached_module::tag_names[cached_module::TYPE_COUNT] = {
+    "UNCOMPILED_WASM_BASE64",
+    "UNCOMPILED_WASM",
+    "UNCOMPILED_JS",
+    "WASM",
+    "JS"};
 
 /* a seperate struct so that "Dispose()" and "ShutdownPlatform()" get called
 even if the constructor for program_t throws */
@@ -497,7 +505,7 @@ template<typename T> v8::Local<T> check_r(v8::MaybeLocal<T> x) {
     return r;
 }
 
-template<typename T> v8::Local<T> check_r(v8::Maybe<T> x) {
+template<typename T> T check_r(v8::Maybe<T> x) {
     T r;
     if(!x.To(&r)) throw bad_request_js{};
     return r;
@@ -552,9 +560,7 @@ constructor for client_connection throws */
 struct autoclose_isolate {
     v8::Isolate* isolate;
 
-    autoclose_isolate(v8::Isolate* isolate) : isolate{isolate} {
-        isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
-    }
+    autoclose_isolate(v8::Isolate* isolate) : isolate{isolate} {}
 
 protected:
     ~autoclose_isolate() { isolate->Dispose(); }
@@ -589,6 +595,15 @@ struct client_connection final : public autoclose_isolate, command_dispatcher {
 
     int compiling;
 
+    /* special flags to allow unit tests to control behaviour */
+    enum {
+        DBG_NOTHING = 0,
+
+        // force compilation to never finish
+        DBG_FAIL_COMPILATION = 1
+    };
+
+    int dbg_flags;
     volatile bool closed;
 
     enum {
@@ -615,12 +630,22 @@ struct client_connection final : public autoclose_isolate, command_dispatcher {
             next_id{1},
             next_async_id{0},
             compiling{0},
+            dbg_flags{DBG_NOTHING},
             closed{false}
     {
         isolate->SetData(0,this);
+        isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
+        isolate->SetPromiseHook([](v8::PromiseHookType type,v8::Local<v8::Promise> promise,v8::Local<v8::Value>) {
+            if(type == v8::PromiseHookType::kResolve) {
+                reinterpret_cast<client_connection*>(
+                    promise->CreationContext()->GetIsolate()->GetData(0)
+                )->tloop->signal_microtasks();
+            }
+        });
 
         uvwrap::write_scope_lock lock{program->connections_lock};
         connection_id = program->next_conn_index++;
+        assert(connection_id);
         program->connections.emplace(connection_id,this);
     }
 
@@ -800,6 +825,7 @@ struct request_task : client_task {
         EXEC,
         CALL,
         GETSTATS,
+        SETDBGFLAGS,
         COUNT_TYPES
     } type;
 
@@ -823,6 +849,7 @@ enum module_req_type_t {
     MODULE_CACHED,
     MODULE_ERROR,
     PURGE_CACHE,
+    QUERY_CACHE,
     MODULE_REQ_COUNT_TYPES
 };
 
@@ -830,7 +857,8 @@ const std::string module_request_types[MODULE_REQ_COUNT_TYPES] = {
     "module",
     "modulecached",
     "moduleerror",
-    "purgecache"
+    "purgecache",
+    "querycache"
 };
 
 struct module_task : client_task {
@@ -870,7 +898,8 @@ const std::string request_task::request_types[request_task::COUNT_TYPES] = {
     "eval",
     "exec",
     "call",
-    "getstats"
+    "getstats",
+    "setdbgflags"
 };
 
 v8::Local<v8::Value> to_value(
@@ -1015,6 +1044,7 @@ public:
     void add_escaped(const v8::String::Value &str);
     void add_escaped(const std::u16string &str);
     void add_escaped_ascii(const char *str);
+    void add_escaped_ascii(const std::string &str);
 
     void add_string(const char *str,size_t length) {
         buffer.insert(buffer.end(),str,str+length);
@@ -1028,6 +1058,10 @@ public:
         size_t length = buffer.size();
         buffer.insert(buffer.end(),STRING_UTF8LENGTH(str,isolate),0);
         STRING_WRITEUTF8(str,isolate,buffer.data() + length);
+    }
+
+    void add_string(const char *str) {
+        while(*str) add_char(*str++);
     }
 
     void add_integer(long i) { add_integer_s<long>(i); }
@@ -1059,6 +1093,11 @@ void string_builder::add_escaped(const std::u16string &str) {
 
 void string_builder::add_escaped_ascii(const char *str) {
     while(*str) add_escaped_char(uint8_t(*str++));
+}
+
+void string_builder::add_escaped_ascii(const std::string &str) {
+    reserve_more(str.size());
+    for(char c : str) add_escaped_char(uint8_t(c));
 }
 
 void string_builder::add_escaped_char(uint8_t c) {
@@ -1594,6 +1633,8 @@ void wasm_compile_success(const v8::FunctionCallbackInfo<v8::Value> &args) noexc
             std::swap(*node->first->get(lock),cache);
         }
 
+        --cc->compiling;
+
         assert(cache.tag == cached_module::UNCOMPILED_WASM);
         if(cache.data.buff.waiting.size()) {
             try {
@@ -1724,8 +1765,14 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                     return;
                 }
 
+                assert(cc->connection_id && !cmod->data.buff.waiting.size());
                 cmod->data.buff.started = cc->connection_id;
                 ++cc->compiling;
+
+                if(cc->dbg_flags & client_connection::DBG_FAIL_COMPILATION) {
+                    args.GetReturnValue().Set(Object::New(isolate));
+                    return;
+                }
             }
         }
 
@@ -1849,6 +1896,8 @@ void getCachedMod(const v8::FunctionCallbackInfo<v8::Value> &args) noexcept {
                         uvwrap::mutex_scope_lock lock{program->module_cache_lock};
                         std::swap(cmod_b,*cmod);
                     }
+
+                    --cc->compiling;
 
                     try {
                         for(auto &w : cmod_b.data.buff.waiting) {
@@ -2168,8 +2217,8 @@ user_exception:
                 unsigned long id = client->new_user_context(false).first;
 
                 response_builder{client->isolate}
-                    ("type","\"success\"")
-                    ("context",id).send(stream);
+                    ("type","\"result\"")
+                    ("value",id).send(stream);
             }
             break;
         case DESTROY_CONTEXT:
@@ -2186,18 +2235,50 @@ user_exception:
                     ("context",id).send(stream);
             }
             break;
-        default:
-            assert(type == GETSTATS);
+        case GETSTATS:
             {
                 string_builder b;
                 b.add_string(R"({"type":"result","value":{"connections":)");
                 b.add_integer(program->connection_count());
                 b.add_string(R"(,"cacheitems":)");
                 b.add_integer(program->cache_count());
+                b.add_string(R"(,"compiling":)");
+                b.add_integer(client->compiling);
                 b.add_string("}}");
                 queue_response(
                     stream,
                     b.get_string());
+            }
+            break;
+        default:
+            assert(type == SETDBGFLAGS);
+            {
+                Local<Value> tmp = get_value(str_value,request_context);
+
+                Local<String> str_fail_compilation = String::NewFromUtf8(
+                    client->isolate,
+                    "FAIL_COMPILATION",
+                    NewStringType::kNormal).ToLocalChecked();
+
+                if(tmp->IsArray()) {
+                    client->dbg_flags = client_connection::DBG_NOTHING;
+                    auto flags = Local<Array>::Cast(tmp);
+                    uint32_t len = flags->Length();
+                    for(uint32_t i=0; i<len; ++i) {
+                        if(check_r(str_fail_compilation->Equals(
+                            request_context,
+                            check_r(flags->Get(request_context,i))))) {
+                            client->dbg_flags |= client_connection::DBG_FAIL_COMPILATION;
+                        }
+                    }
+                    queue_response(
+                        stream,
+                        copy_string(R"({"type":"success"})"));
+                } else {
+                    queue_response(
+                        stream,
+                        copy_string(R"({"type":"error","errtype":"request","message":"value must be an array"})"));
+                }
             }
             break;
         }
@@ -2285,6 +2366,7 @@ void module_task::Run() {
                 if(client->closed) return;
                 fprintf(stderr,"error occurred while trying to report another error\n");
                 client->close_async();
+                return;
             }
         }
     } catch(std::bad_alloc&) {
@@ -2402,19 +2484,20 @@ void program_t::register_task() {
         if(type_i == -1) return;
 
         auto type = static_cast<module_req_type_t>(type_i);
-        if(type == PURGE_CACHE) {
-            auto itr = command_buffer.value.find(str_ids);
-            if(itr != command_buffer.value.end()) {
-                if(itr->second.is_string) throw bad_request_error{"invalid value type"};
+        switch(type) {
+        case PURGE_CACHE:
+            {
+                auto &ids = get_parsed_value(this,str_ids);
+                if(ids.is_string) throw bad_request_error{"invalid value type"};
 
                 uvwrap::mutex_scope_lock lock{module_cache_lock};
 
-                if(itr->second.data == "null") {
+                if(ids.data == "null") {
                     module_cache.clear();
                 } else {
                     almost_json_parser::array_parser p;
                     try {
-                        p.feed(itr->second.data.data(),itr->second.data.size());
+                        p.feed(ids.data.data(),ids.data.size());
                         p.finish();
                     } catch(almost_json_parser::syntax_error&) {
                         throw bad_request_error{"invalid JSON"};
@@ -2426,9 +2509,45 @@ void program_t::register_task() {
                         if(itr != module_cache.end()) module_cache.erase(itr);
                     }
                 }
-
-                return;
             }
+            return;
+        case QUERY_CACHE:
+            {
+                string_builder b;
+                b.add_string(R"({"type":"result","value":{)");
+                {
+                    uvwrap::mutex_scope_lock lock{module_cache_lock};
+                    bool started = false;
+                    for(auto &item : module_cache) {
+                        if(started) b.add_char(',');
+                        started = true;
+                        b.add_char('"');
+
+                        /* the ID is a UTF-8 string, not ascii, but this is only
+                        used for unit testing so we don't bother adding code to
+                        convert*/
+                        b.add_escaped_ascii(item->id);
+
+                        b.add_string(R"(":{"type":")");
+                        auto mod = item->get(lock);
+                        b.add_string(cached_module::tag_names[mod->tag]);
+                        b.add_string(R"(","waitingcount":)");
+                        if(mod->is_uncompiled()) {
+                            b.add_integer(mod->data.buff.waiting.size());
+                        } else {
+                            b.add_char('0');
+                        }
+                        b.add_char('}');
+                    }
+                }
+                b.add_string("}}");
+                queue_response(
+                    stdout,
+                    b.get_string());
+            }
+            return;
+        default:
+            break;
         }
 
         connection_id_t cc_id;
@@ -2549,30 +2668,60 @@ void signal_handler(uv_signal_t*,int) {
     program->main_loop.stop();
 }
 
-v8::StartupData create_snapshot() {
+v8::StartupData create_snapshot(v8_platform &platform) {
     using namespace v8;
 
-    v8::StartupData r{nullptr,0};
+    uvwrap::mutex_t mut;
+    uvwrap::cond_t cond;
+    bool ready = false;
+
+    StartupData r{nullptr,0};
 
     SnapshotCreator creator{external_references};
     auto isolate = creator.GetIsolate();
-    {
-        Isolate::Scope isolate_scope{isolate};
-        HandleScope handle_scope{isolate};
 
-        auto context = Context::New(isolate,nullptr,get_globals(isolate));
-        Context::Scope context_scope{context};
+    struct task : Task {
+        StartupData &data;
+        SnapshotCreator &creator;
+        uvwrap::cond_t &cond;
+        bool &ready;
+        task(StartupData &data,SnapshotCreator &creator,uvwrap::cond_t &cond,bool &ready) :
+            data{data},
+            creator{creator},
+            cond{cond},
+            ready{ready} {}
 
-        Local<String> code;
-        Local<Script> compiled;
-        if(
-            !String::NewFromUtf8(isolate,startup_code,NewStringType::kNormal).ToLocal(&code) ||
-            !Script::Compile(context,code).ToLocal(&compiled) ||
-            compiled->Run(context).IsEmpty()) return r;
+        void Run() {
+            auto isolate = creator.GetIsolate();
+            Locker locker{isolate};
 
-        creator.SetDefaultContext(context);
-    }
-    r = creator.CreateBlob(SnapshotCreator::FunctionCodeHandling::kKeep);
+            {
+                Isolate::Scope isolate_scope{isolate};
+                HandleScope handle_scope{isolate};
+
+                auto context = Context::New(isolate,nullptr,get_globals(isolate));
+                Context::Scope context_scope{context};
+
+                Local<String> code;
+                Local<Script> compiled;
+                if(
+                    !String::NewFromUtf8(isolate,startup_code,NewStringType::kNormal).ToLocal(&code) ||
+                    !Script::Compile(context,code).ToLocal(&compiled) ||
+                    compiled->Run(context).IsEmpty()) goto end;
+
+                creator.SetDefaultContext(context);
+            }
+            data = creator.CreateBlob(SnapshotCreator::FunctionCodeHandling::kKeep);
+
+        end:
+            ready = true;
+            cond.signal();
+        }
+    };
+
+    auto tloop = platform.get_task_loop(isolate);
+    tloop->PostTask(std::unique_ptr<task>{new task(r,creator,cond,ready)});
+    while(!ready) cond.wait(mut);
 
     return r;
 }
@@ -2582,8 +2731,8 @@ program_t::program_t() :
     sig_request{main_loop},
     stdin{main_loop},
     stdout{main_loop},
-    snapshot{create_snapshot()},
-    next_conn_index{0},
+    snapshot{create_snapshot(platform)},
+    next_conn_index{1}, // this must not be zero
     shutting_down{false},
     console_enabled{false},
     func_dispatcher{
@@ -2634,7 +2783,6 @@ int main(int argc, char* argv[]) {
         program_t p;
         program = &p;
 
-        // TODO: allow enabling the console with a flag or environment variable
 #ifndef NDEBUG
         p.console_enabled = true;
 #endif

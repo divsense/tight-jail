@@ -223,6 +223,10 @@ class JailConnection {
                 case 'error':
                     JailConnection._backgroundError('error in importer stream: ' + data.message);
                     break;
+                case 'result':
+                    for(let cq of JailConnection._cacheQueries) cq(data.value);
+                    JailConnection._cacheQueries.length = 0;
+                    break;
                 default:
                     JailConnection._backgroundError('unknown result type in importer stream');
                     break;
@@ -281,6 +285,7 @@ class JailConnection {
 // #if this.NODEONLY
                     JailConnection._server_proc = child_process.fork(
                         path.join(__dirname,'jailed.js'),
+                        [JailConnection._getSocketName()],
                         options);
 // #else
                     JailConnection._server_proc = child_process.spawn(
@@ -348,7 +353,7 @@ class JailConnection {
             this._requestQueue.shift()[0](msg.value);
             break;
         case 'success':
-            this._requestQueue.shift()[0](msg.context);
+            this._requestQueue.shift()[0](null);
             break;
         case 'asyncresult':
         case 'asyncresultexception':
@@ -451,6 +456,23 @@ class JailConnection {
         return this.request('{"type":"getstats"}');
     }
 
+    _setDbgFlags(flags) {
+        return this.request({
+            type: 'setdbgflags',
+            value: Array.from(flags)});
+    }
+
+    /* note that the returned keys are equivalent to
+    Buffer.from(original,'utf8').toString('ascii') when using the native jail
+    executable*/
+    static _queryCache() {
+        return new Promise((resolve,reject) => {
+            let len = JailConnection._cacheQueries.length;
+            JailConnection._cacheQueries.push(resolve);
+            if(!len) JailConnection._server_proc.stdin.write('{"type":"querycache"}\0');
+        });
+    }
+
     isPending() {
         return (this._server ? this._requestQueue : this._pendingRequests).length != 0;
     }
@@ -469,6 +491,7 @@ JailConnection._moduleLoader = defaultLoader;
 JailConnection._moduleID = defaultModID;
 JailConnection._modCache = new UniqueFIFO();
 JailConnection._maxCacheQty = DEFAULT_CACHE_QTY;
+JailConnection._cacheQueries = [];
 
 exports.JailConnection = JailConnection;
 
@@ -505,8 +528,9 @@ exports.purgeCache = purgeCache;
 function shutdown() {
     if(JailConnection._server_proc) {
         JailConnection._server_proc.kill('SIGINT');
-        if(JailConnection._pending_init)
-            JailConnection._pending_init.forEach(inst => { inst.close(); });
+        if(JailConnection._pending_init) {
+            for(let inst of JailConnection._pending_init) inst.close();
+        }
     }
 
     JailConnection._proc_ready = false;
@@ -578,6 +602,8 @@ class JailContext {
     }
 
     getStats() { return this._connection.getStats(); }
+
+    _setDbgFlags(flags) { return this._connection._setDbgFlags(flags); }
 }
 exports.JailContext = JailContext;
 

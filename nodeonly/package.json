@@ -1,8 +1,13 @@
 {
   "name": "tight-jail-nodeonly",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Execute untrusted JavaScript securely",
   "main": "index.js",
+  "files": [
+    "jail_worker.js",
+    "requests.js",
+    "test/*"
+  ],
   "scripts": {
     "test": "mocha",
     "prepare": "node ../prepare.js -DNODEONLY ."
@@ -30,5 +35,8 @@
     "chai": "^4.1.2",
     "chai-as-promised": "^7.1.1",
     "mocha": "^5.2.0"
+  },
+  "engines": {
+    "node": ">=11.12"
   }
 }

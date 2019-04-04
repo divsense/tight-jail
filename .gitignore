@@ -4,3 +4,7 @@ nodejs/daemon/*.dll
 nodejs/daemon/*.dat
 nodejs/daemon/*.bin
 nodejs/daemon/jsjaild
+nodejs/index.js
+nodejs/test/test.js
+nodeonly/index.js
+nodeonly/test/test.js

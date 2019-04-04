@@ -8,8 +8,8 @@ var j = new tightjail.JailContext();
 j.eval('5 * 7').then(x => {
     console.log(x);
 
-    return j.exec('function somefun(a,b,c) { return a * (b + c); }');
-}).then(() => {
+    j.exec('function somefun(a,b,c) { return a * (b + c); }');
+
     return j.call('somefun',[4,5,6]);
 }).then(x => {
     console.log(x);
@@ -25,7 +25,7 @@ async function doit() {
     try {
         console.log(await j.eval('5 * 7'));
 
-        await j.exec('function somefun(a,b,c) { return a * (b + c); }');
+        j.exec('function somefun(a,b,c) { return a * (b + c); }');
         console.log(await j.call('somefun',[4,5,6]));
     } finally {
         j.close();
@@ -35,7 +35,9 @@ async function doit() {
 doit();
 ```
 
-Tight-jail has three variants that have the same interface:
+A jailed execution context is created by creating a new instance of `JailContext`. Each context is completely isolated from each other and runs in its own thread.
+
+Tight-jail has three variants that have a common interface:
 
 ### A Variant for Browsers:
 Code is executed in a Web Worker inside an IFRAME.
@@ -91,21 +93,25 @@ or a promise that resolves to one of the prior three.
 * A buffer containing a WASM binary. `jimport` resolves the compiled and
   instantiated module.
 
-If `getID` is specified, instead of passing the argument from `jimport` directly
-to `loader`, it is passed to `getID` and its result is either retrieved from the
-cache or passed to `loader` (`getID` may also return a promise). This is useful
-for when the same module can be identified by different strings (e.g. because of
+If `getID` is specified, instead of using the argument from `jimport` directly,
+it is passed to `getID` and its result is either retrieved from the cache or
+passed to `loader` (`getID` may also return a promise). This is useful for when
+the same module can be identified by different strings (e.g. because of
 case-insensitivity).
+
+If either `loader` or `getID` throws an exception, the exception is converted to
+a string and `jimport` rejects with an instance of `JailImportError` containing
+the string value.
 
 There are two levels of cache. Each `JailContext` has its own cache of
 instantiated modules, thus importing the same module in the same context will
 yield the same instance. There is also a global cache, storing up to
 `maxCacheQty` entries (by default 50). The global cache allows multiple contexts
 to instantiate the same module without compiling them again. When the maximum
-number of cache entries is exceeded, the last entry to be instantiated, will be
-released. This has no effect on instances of module. Module instances are not
-freed until the context in which they are loaded, is destroyed. The cache can be
-cleared with `purgeCache`.
+number of cache entries is exceeded, the entry that has gone the longest without
+being instantiated, will be released. This has no effect on instances of
+modules. Module instances are not freed until the context in which they are
+loaded, is destroyed. The cache can be cleared with `purgeCache`.
 
 Because `jimport` returns a promise, the recommended way to use modules is to
 place the call to `jimport` and the code that uses the module inside an `async`
@@ -127,8 +133,6 @@ tightjail.setModuleLoader(loader);
     var j = new tightjail.JailContext();
 
     try {
-        /* await is not required here because all requests are carried out
-        in order */
         j.exec('
             var mod = null;
             async function main() { mod = await jimport("A"); }
@@ -222,7 +226,7 @@ Return a promise to execute a string containing JavaScript code.
 
 ---------------------------------------------------
 
-##### `JailContext.prototype.call(func,args=[])`
+##### `JailContext.prototype.call(func,args=[],resolve_async=false)`
 
 Return a promise to execute a JavaScript function `func` with arguments `args`.
 
@@ -279,6 +283,46 @@ Unlike the other exceptions, this does not inherit from JailError.
 
 ---------------------------------------------------
 
+#### Functions
+
+##### `setModuleLoader(loader,getID=null,maxCacheQty=null)`
+
+Set the module loading callbacks that are called when `jimport` is called from
+jailed code.
+
+`loader` is expected to take one string argument and return a string containing
+a JavaScript module, a buffer (an instance of `ArrayBuffer` when using the
+browser variant and `Buffer` when using one of the Node.js variants) containing
+a WASM module or `null` to indicate no such module exists. Passing a value of
+`null` for `loader` is the same as passing `x => null`.
+
+`getID` is expected to take one string argument and return another string value
+or `null`. This function is used to translate all values given to `jimport`, to
+allow different strings to map to the same module. Passing a value of `null` for
+`getID` is the same as passing the identity function (`x => x`).
+
+`maxCacheQty` is expected to be an integer or `null`. Passing a value of `null`
+is the same as passing the default value (50). When the number of cache items
+exceeds this value, the entry that has gone the longest without being
+instantiated, will be released. This has no effect on instances of modules.
+Module instances are not freed until the corresponding context is closed.
+
+---------------------------------------------------
+
+##### `purgeCache(items=null)`
+
+Remove items from the cache.
+
+If `items` is null, all items are removed from the cache. Otherwise it should be
+an iterable value where each element corresponds to a value that was previously
+given to the `loader` function specified by `setModuleLoader`. Elements that
+don't correspond to any cache item are ignored.
+
+This does not unload already loaded module instances. Module instances are not
+freed until the corresponding context is closed.
+
+---------------------------------------------------
+
 ### Node-Specific Syntax
 
 #### class `JailConnection`
@@ -328,7 +372,7 @@ Return a promise to execute a string containing JavaScript code.
 
 ---------------------------------------------------
 
-##### `JailConnection.prototype.call(func,args=[],context=null)`
+##### `JailConnection.prototype.call(func,args=[],context=null,resolve_async=false)`
 
 Return a promise to execute a JavaScript function `func` with arguments `args`.
 

@@ -47,8 +47,6 @@ task_loop::task_loop(v8::Isolate *isolate) :
 
                     task->Run();
                 }
-                v8::Locker lock{tloop->isolate};
-                tloop->isolate->RunMicrotasks();
             }
 
             for(;;) {
@@ -75,14 +73,21 @@ task_loop::task_loop(v8::Isolate *isolate) :
 
                     task->Run();
                 }
-                v8::Locker lock{tloop->isolate};
-                tloop->isolate->RunMicrotasks();
             }
 
             uvwrap::mutex_scope_lock lock{tloop->task_lock};
             if(!tloop->delayed_task_queue.empty()) {
                 tloop->set_timer(tloop->delayed_task_queue.top().first - steady_seconds());
             }
+        },
+        this},
+    micro_dispatcher{
+        loop,
+        [](uv_async_t *handle) {
+            auto tloop = reinterpret_cast<task_loop*>(handle->data);
+
+            v8::Locker lock{tloop->isolate};
+            tloop->isolate->RunMicrotasks();
         },
         this},
     delay_timer{loop,this},

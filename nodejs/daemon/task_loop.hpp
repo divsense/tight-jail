@@ -26,6 +26,7 @@ class task_loop : public v8::TaskRunner {
     uvwrap::loop_t loop;
     uvwrap::mutex_t task_lock;
     uvwrap::async_t dispatcher;
+    uvwrap::async_t micro_dispatcher;
     uvwrap::timer_t delay_timer;
     uv_thread_t thread;
     std::atomic<int> status;
@@ -42,6 +43,10 @@ public:
     bool IdleTasksEnabled();
 
     void close();
+
+    void signal_microtasks() {
+        micro_dispatcher.send(std::nothrow);
+    }
 };
 
 
@@ -68,6 +73,7 @@ public:
     }
 
     void remove_task_loop(v8::Isolate* isolate) {
+        uvwrap::mutex_scope_lock lock{runner_lock};
         runner_map.erase(isolate);
     }
 

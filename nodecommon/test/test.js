@@ -436,5 +436,58 @@ describe('tight-jail',function () {
                 j.close();
             }
         });
+
+        /* a thread could be closed before finishing compilation, in which case,
+        if there are other threads waiting, one of the waiting threads needs to
+        resume compilation */
+        it('should be able to resume compilation in a different thread',async function() {
+            jail.purgeCache();
+            jail.setModuleLoader(moduleResolver,moduleNameNormalizer);
+
+            const code = 'async function X(mod,a) {' +
+                           'var m = await jimport(mod);' +
+                           'return m.square(a); }';
+
+            let j1Finished = false;
+
+            let j1 = new jail.JailContext();
+            try {
+                j1.exec(code);
+                await j1._setDbgFlags(['FAIL_COMPILATION']);
+                j1.call('X',['a',7],true)
+                    .then(() => { j1Finished = true; })
+                    .catch(() => {});
+
+                while(!(await j1.getStats()).compiling) await sleep(10);
+
+                let j2 = new jail.JailContext();
+                try {
+                    await j2.exec(code);
+                    let value1 = 0;
+                    let call2 = j2.call('X',['a',0.5],true).then(x => { value1 = x; });
+
+                    let value2 = 0;
+                    let call3 = j2.call('X',['A',10],true).then(x => { value2 = x; });
+
+                    /* wait for the second request to be added to the waiting
+                    list */
+                    while(!(await jail.JailConnection._queryCache())['a'].waitingcount) await sleep(10);
+
+                    /* this should cause the compilation to be passed to another
+                    thread */
+                    j1.close();
+
+                    assert.isNotOk(j1Finished);
+                    await call2;
+                    await call3;
+                    assert.equal(value1,0.25);
+                    assert.equal(value2,100);
+                } finally {
+                    j2.close();
+                }
+            } finally {
+                j1.close();
+            }
+        });
     });
 });
