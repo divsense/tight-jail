@@ -133,12 +133,12 @@ tightjail.setModuleLoader(loader);
     var j = new tightjail.JailContext();
 
     try {
-        j.exec('
-            var mod = null;
-            async function main() { mod = await jimport("A"); }
-            function nineSquared() {
-                return mod.square(9);
-            }');
+        j.exec(
+            'var mod = null;' +
+            'async function main() { mod = await jimport("A"); }' +
+            'function nineSquared() {' +
+            '    return mod.square(9);' +
+            '}');
 
         /* await is required because "main" returns a promise and promises
         are not guaranteed to be resolved in any particular order */
