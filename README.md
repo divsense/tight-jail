@@ -35,7 +35,31 @@ async function doit() {
 doit();
 ```
 
-A jailed execution context is created by creating a new instance of `JailContext`. Each context is completely isolated from each other and runs in its own thread.
+A jailed execution context is created by creating a new instance of
+`JailContext`. Each context is completely isolated from each other and runs in
+its own thread. When a context is no longer needed, the `close` method must be
+called to free the resources used by the context. When using one of the Node
+versions of tight-jail, the `shutdown` function also needs be called for Node to
+exit automatically (although there is no harm in forcing Node to exit without
+calling `shutdown`). Code can be executed in the jail via the `eval`, `exec`,
+`call` and `execURI` methods:
+
+* `eval(code)` evaluates JavaScript and returns the value of the last line,
+  similar to the built-in `eval` function.
+* `exec(code)` runs code but doesn't return a value.
+* `call(func,args=[],resolve_async=false)` calls a function and returns the
+  resulting value. If `resolve_async` is true, `Promise.resolve` is called on
+  the return value.
+* `execURI` loads a JavaScript file from a URI and runs it.
+
+All four methods return a promise. The code passed to `eval`, `exec` and `call`
+for a particular context, is guaranteed to be executed in the order the
+functions are called, but when `call` is used with `resolve_async` set to
+`true`, the returned value is passed to `Promise.resolve`, which is not
+guaranteed to be executed in any particular order.
+
+Code can also be executed via custom modules (see _Module and WASM Support_
+below).
 
 Tight-jail has three variants that have a common interface:
 
