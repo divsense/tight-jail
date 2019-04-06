@@ -423,7 +423,7 @@ process.on('SIGINT',() => {
     process.stdin.destroy();
     let conns = Conn.connections;
     Conn.connections = new Map();
-    for(let c of conns) c.close();
+    for(let [id,c] of conns) c.close();
 });
 
 

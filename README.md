@@ -52,11 +52,11 @@ calling `shutdown`). Code can be executed in the jail via the `eval`, `exec`,
   the return value.
 * `execURI` loads a JavaScript file from a URI and runs it.
 
-All four methods return a promise. The code passed to `eval`, `exec` and `call`
-for a particular context, is guaranteed to be executed in the order the
-functions are called, but when `call` is used with `resolve_async` set to
-`true`, the returned value is passed to `Promise.resolve`, which is not
-guaranteed to be executed in any particular order.
+All four methods return a promise. For a given context, the code passed to
+`eval`, `exec` and `call` is guaranteed to be executed in the order the
+functions are called. However, when `call` is used with `resolve_async` set to
+`true`, the returned value is passed to `Promise.resolve`, and the promise is
+not guaranteed to be resolved in any particular order.
 
 Code can also be executed via custom modules (see _Module and WASM Support_
 below).
@@ -227,11 +227,16 @@ MSVC.
 
 ## API
 
-### Common Syntax
+### Common API
 
 #### class `JailContext`
 
 ##### `JailContext.prototype.constructor(autoClose=false)`
+
+Constructor for `JailContext`.
+
+If `autoClose` is `true`. `close` is called automatically after a request
+(`eval`/`exec`/`call`/`execURI`) has been carried out.
 
 ---------------------------------------------------
 
@@ -252,10 +257,17 @@ Return a promise to execute a string containing JavaScript code.
 
 ##### `JailContext.prototype.call(func,args=[],resolve_async=false)`
 
-Return a promise to execute a JavaScript function `func` with arguments `args`.
+Return a promise to execute a JavaScript function `func` with arguments `args`,
+and return the result.
 
 `func` must be a string and the name of a function defined in the given context
-(or a built-in function).
+or a built-in function.
+
+`args`, if supplied, must be a list of arguments to pass to the function. The
+arguments must be convertable to JSON.
+
+If `resolve_async` is `true`, the return value of the function will be passed to
+`Promise.resolve` before being returned to the client.
 
 ---------------------------------------------------
 
@@ -347,7 +359,7 @@ freed until the corresponding context is closed.
 
 ---------------------------------------------------
 
-### Node-Specific Syntax
+### Node-Specific API
 
 #### class `JailConnection`
 
@@ -363,6 +375,11 @@ and `execURI` take an optional `context`
 ---------------------------------------------------
 
 ##### `JailConnection.prototype.constructor(autoClose=false)`
+
+Constructor for `JailConnection`.
+
+If `autoClose` is `true`. `close` is called automatically after a request
+(`eval`/`exec`/`call`/`execURI`) has been carried out.
 
 ---------------------------------------------------
 
@@ -398,10 +415,17 @@ Return a promise to execute a string containing JavaScript code.
 
 ##### `JailConnection.prototype.call(func,args=[],context=null,resolve_async=false)`
 
-Return a promise to execute a JavaScript function `func` with arguments `args`.
+Return a promise to execute a JavaScript function `func` with arguments `args`,
+and return the result.
 
 `func` must be a string and the name of a function defined in the given context
 (or a built-in function).
+
+`args`, if supplied, must be a list of arguments to pass to the function. The
+arguments must be convertable to JSON.
+
+If `resolve_async` is `true`, the return value of the function will be passed to
+`Promise.resolve` before being returned to the client.
 
 ---------------------------------------------------
 
