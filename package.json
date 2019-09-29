@@ -1,0 +1,24 @@
+{
+  "name": "tight-jail",
+  "version": "0.4.0",
+  "description": "Meta-package for the different tight-jail implementations",
+  "main": "index.js",
+  "files": [],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/divsense/tight-jail.git"
+  },
+  "keywords": [
+    "jail",
+    "sandbox"
+  ],
+  "author": "Rouslan Korneychuk",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/divsense/tight-jail/issues"
+  },
+  "homepage": "https://github.com/divsense/tight-jail#readme",
+  "dependencies": {
+    "tight-jail-nodeonly": "file:./nodeonly"
+  }
+}
