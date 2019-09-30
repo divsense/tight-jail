@@ -4,7 +4,7 @@
   "description": "Meta-package for the different tight-jail implementations",
   "main": "index.js",
   "scripts": {
-    "postinstall": "node prepare.js -DNODEONLY nodeonly && npm install nodeonly"
+    "postinstall": "node prepare.js -DNODEONLY nodeonly && npm install ./nodeonly"
   },
   "repository": {
     "type": "git",
