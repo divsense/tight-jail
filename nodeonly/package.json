@@ -5,6 +5,7 @@
   "main": "index.js",
   "files": [
     "jail_worker.js",
+    "jailed.js",
     "requests.js",
     "test/*"
   ],
